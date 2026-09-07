@@ -1,0 +1,40 @@
+
+Earliest Timestamp: 2008-07-19 11:55:00
+
+Latest Timestamp: 2008-10-17 06:07:00
+
+Number of Unique Timestamps: 1534
+
+==========================
+
+Temporal Cutoff Candidates:
+
+==========================
+
+
+Candidate 1:
+    target_fail_count: 15
+    cutoff_timestamp: 2008-10-04 23:18:00
+    dev_n: 1303
+    dev_fail_count: 89
+    test_n: 264
+    test_fail_count: 15
+    test_fail_rate_pct: 5.682
+
+Candidate 2:
+    target_fail_count: 20
+    cutoff_timestamp: 2008-10-02 08:57:00
+    dev_n: 1238
+    dev_fail_count: 84
+    test_n: 329
+    test_fail_count: 20
+    test_fail_rate_pct: 6.079
+
+Candidate 3:
+    target_fail_count: 25
+    cutoff_timestamp: 2008-09-28 08:41:00
+    dev_n: 1151
+    dev_fail_count: 79
+    test_n: 416
+    test_fail_count: 25
+    test_fail_rate_pct: 6.01
