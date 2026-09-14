@@ -4,7 +4,7 @@ import os
 import seaborn as sns
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-from utils_save_result import save_result
+from utils import save_result
 
 def save_figure(fig, script_name, filename, base_dir="graph", dpi=150):
     target_dir = os.path.join(base_dir, script_name)
