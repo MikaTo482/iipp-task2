@@ -170,7 +170,7 @@ duplicate_feature_ids = duplicated_mask[duplicated_mask].index.tolist()
 
 # ----------------------------------------------------------------------
 # Correlation Audits
-# ----------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 def audit_correlation_structure(X):
     corr_matrix = X.corr().abs()
