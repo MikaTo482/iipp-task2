@@ -87,7 +87,7 @@ def find_near_zero_variance_features(X, freq_cut=95/5, unique_cut=10.0):
 # ----------------------------------------------------------------------
 
 def audit_correlation_structure(X):
-    corr_matrix = X.corr().abs()
+    corr_matrix = X.select_dtypes(include="number").corr().abs()
 
     upper_mask = np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
     upper = corr_matrix.where(upper_mask)

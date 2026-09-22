@@ -8,11 +8,32 @@ from sklearn.feature_selection import VarianceThreshold
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
-from utils import find_temporal_cutoff_candidates
+from utils import find_temporal_cutoff_candidates, missing_rate_filter, correlation_filter, duplicate_filter, save_figure
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, AdaBoostClassifier, GradientBoostingClassifier
+from sklearn.metrics import classification_report, recall_score, confusion_matrix, average_precision_score, precision_score, f1_score, matthews_corrcoef
+from imblearn.over_sampling import SMOTE
+import matplotlib.pyplot as plt
+from sklearn.neighbors import KNeighborsClassifier
+
+
+
+try:
+    from xgboost import XGBClassifier
+except ImportError:
+    XGBClassifier = None
+try:
+    from lightgbm import LGBMClassifier
+except ImportError:
+    LGBMClassifier = None
+try:
+    from catboost import CatBoostClassifier
+except ImportError:
+    CatBoostClassifier = None
 
 RANDOM_SEED = 42
-TEST_SIZE = 0.20
-VAL_SIZE = 0.20
+TEST_SIZE = 0.10
+VAL_SIZE = 0.10
 SPLIT_DIR = "splits"
 TARGET_COL = "label"
 DEV_INDICES_PATH = os.path.join(SPLIT_DIR, "dev_indices.csv")
@@ -204,7 +225,7 @@ if __name__ == "__main__":
     print(dev_df.columns.tolist())
 
     X = dev_df.drop([TARGET_COL, "timestamp"], axis = 1)
-    y = dev_df[TARGET_COL]
+    y = (dev_df[TARGET_COL] == 1).astype(int) 
 
     # =========================================================================
     # TRACK A
@@ -218,6 +239,16 @@ if __name__ == "__main__":
         random_state=RANDOM_SEED,
         shuffle=True,
     )
+    missing_list = missing_rate_filter(X_train, 50)
+    X_train = X_train.drop(columns = missing_list)
+    correlation_list = correlation_filter(X_train, 0.995)
+    X_train = X_train.drop(columns = correlation_list)
+    duplicate_list = duplicate_filter(X_train)
+    X_train = X_train.drop(columns = duplicate_list)
+
+    X_val = X_val.drop(columns = missing_list)
+    X_val = X_val.drop(columns = correlation_list)
+    X_val = X_val.drop(columns = duplicate_list)
 
     pipeline = Pipeline([
         ('remove_constant', VarianceThreshold(threshold=0.0)), # constant features removal
@@ -237,6 +268,10 @@ if __name__ == "__main__":
 
     print(f"Number of features in X_train: {X_train.shape[1]} | Number of features in X_train processed: {X_train_processed.shape[1]}")
     print(f"Number of features in X_val: {X_val.shape[1]} | Number of features in X_val processed: {X_val_processed.shape[1]}")
+
+    smote = SMOTE(random_state=RANDOM_SEED)
+    X_train_smote, y_train_smote = smote.fit_resample(X_train_processed, y_train)
+    print("After SMOTE", y_train_smote.value_counts())
 
 
     # =========================================================================
@@ -266,7 +301,88 @@ if __name__ == "__main__":
     print("Class Distribution (Test) \n")
     print(test_temporal[TARGET_COL].value_counts())
 
+
+    # =========================================================================
+    # Initial Experiment
+    # =========================================================================
+
+    models = {
+        "LogisticRegression": LogisticRegression(max_iter=1000, random_state=RANDOM_SEED),
+        "RandomForest": RandomForestClassifier(random_state=RANDOM_SEED),
+        "XGBoost": XGBClassifier(random_state=RANDOM_SEED),
+        "LightGBM": LGBMClassifier(random_state=RANDOM_SEED, verbose=-1),
+        "CatBoost": CatBoostClassifier(random_seed=RANDOM_SEED, verbose=0),
+        "KNN": KNeighborsClassifier(n_neighbors=10),
+        "AdaBoosting": AdaBoostClassifier(n_estimators=100, random_state=42),
+        "GradientBoosting": GradientBoostingClassifier(n_estimators=100, random_state=42),
+    }
+
+    results = []
+
+    for name, model in models.items():
+        model.fit(X_train_smote, y_train_smote)
+        y_pred = model.predict(X_val_processed)
+        y_proba = model.predict_proba(X_val_processed)[:, 1]
+
+        results.append({
+            "model": name,
+            "pr_auc": average_precision_score(y_val, y_proba),
+            "recall": recall_score(y_val, y_pred, zero_division=0),
+            "precision": precision_score(y_val, y_pred, zero_division=0),
+            "f1": f1_score(y_val, y_pred, zero_division=0),
+            "mcc": matthews_corrcoef(y_val, y_pred),
+        })
+
+        print(f"{name} done")
+
+    results_df = pd.DataFrame(results).sort_values("recall", ascending=False).reset_index(drop=True)
+    print(results_df.round(3).to_string(index=False))
+
+
+    metrics = {"pr_auc": "PR AUC", "recall": "Recall", "precision": "Precision",
+           "f1": "F1", "mcc": "MCC"}
+    colors = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B3"]
+
+    df_plot = results_df.set_index("model")
+    n_models, n_metrics = len(df_plot), len(metrics)
+    bar_h = 0.8 / n_metrics
+    y = np.arange(n_models)
+
+    fig1, ax = plt.subplots(figsize=(11, 0.9 * n_models + 1.5))
+
+    for i, ((col, label), color) in enumerate(zip(metrics.items(), colors)):
+        pos = y + 0.4 - bar_h * (i + 0.5)          
+        values = df_plot[col].to_numpy()
+        bars = ax.barh(pos, values, height=bar_h, color=color, label=label)
+        ax.bar_label(bars, labels=[f"{v:.2f}" if abs(v) >= 0.005 else "" for v in values],
+                    padding=2, fontsize=7.5)
+
+
+    for k in range(0, n_models, 2):
+        ax.axhspan(k - 0.5, k + 0.5, color="#f2f2f2", zorder=0)
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(df_plot.index, fontsize=10)
+    ax.set_ylim(-0.5, n_models - 0.5)
+    ax.set_xlim(min(0, df_plot[list(metrics)].min().min()) - 0.05,
+                df_plot[list(metrics)].max().max() + 0.08)
+    ax.set_xlabel("Score")
+    ax.set_title("Model comparison on validation set (threshold 0.5)",
+                fontsize=13, fontweight="bold", pad=35)
+    ax.legend(loc="lower center", bbox_to_anchor=(0.5, 1.0), ncol=6,
+            frameon=False, fontsize=9)
+    ax.grid(axis="x", linestyle=":", alpha=0.6)
+    ax.set_axisbelow(True)
+    for side in ["top", "right"]:
+        ax.spines[side].set_visible(False)
+
+    fig1.tight_layout()
+    save_figure(fig1, script_name="03_track_evaluation", filename="metric_comparison", dpi=150)
+    plt.close(fig1)
+
+
     view_test_access_log()
+
 
 
 

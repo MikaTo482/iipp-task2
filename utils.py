@@ -11,7 +11,8 @@ Mirrors the same behavior as save_figure():
 """
 
 import os
-
+import pandas as pd
+import numpy as np
 
 def save_result(content: str, script_name: str, filename: str, base_dir: str = "result"):
     """
@@ -113,3 +114,56 @@ def find_temporal_cutoff_candidates(cutoff_input, target_fail_counts=[15, 20, 25
         }
 
     return candidates
+
+def correlation_filter(X, threshold=0.95):
+
+    if not 0 <= threshold <= 1:
+        raise ValueError("threshold have to be proportion format between 0 and 1")
+    if len(X) == 0:
+        raise ValueError("X data not found")
+    
+    corr_matrix = X.select_dtypes(include="number").corr().abs()
+    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+
+    pairs = upper.stack().reset_index()
+    pairs.columns = ["feature_1", "feature_2", "correlation"]
+    pairs = pairs[pairs["correlation"] >= threshold] \
+        .sort_values("correlation", ascending=False)
+
+    to_drop = set()
+    for f1, f2 in zip(pairs["feature_1"], pairs["feature_2"]):
+        if f1 in to_drop or f2 in to_drop:
+            continue
+        to_drop.add(f2)
+
+    print(len(to_drop), f"features have correlation >= {threshold}")
+    return list(to_drop)
+
+
+def missing_rate_filter(X, threshold):
+    if not 0 <= threshold <= 100:
+        raise ValueError("threshold have to be percentage format between 0 and 100")
+    if len(X) == 0:
+        raise ValueError("X data not found")
+
+    miss_rate = pd.DataFrame(X.isna().sum() / len(X) * 100).reset_index()
+    miss_rate.columns = ["feature", "missing_rate"]
+    miss_by_thres = miss_rate[miss_rate["missing_rate"] > threshold]
+    print(len(miss_by_thres), f"features have more than {threshold}% missing values")
+    return miss_by_thres["feature"].tolist()
+
+def duplicate_filter(X):
+    to_drop = X.columns[X.T.duplicated(keep="first")].tolist()
+    print(len(to_drop), "features are exact duplicates")
+    return to_drop
+
+def save_figure(fig, script_name, filename, base_dir="graph", dpi=150):
+    target_dir = os.path.join(base_dir, script_name)
+    os.makedirs(target_dir, exist_ok=True)
+
+    target_path = os.path.join(target_dir, filename)
+
+    if os.path.exists(target_path):
+        os.remove(target_path)
+
+    fig.savefig(target_path, dpi=dpi, bbox_inches="tight")
