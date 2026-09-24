@@ -1,0 +1,33 @@
+{
+  "split_type": "temporal",
+  "target_col": "label",
+  "target_fail_count": 15,
+  "candidate_fail_counts": [
+    15,
+    20,
+    25
+  ],
+  "cutoff_timestamp": "2008-10-04T23:18:00",
+  "n_total": 1567,
+  "n_dev": 1303,
+  "n_test": 264,
+  "n_fail_dev": 89,
+  "n_fail_test": 15,
+  "class_counts_dev": {
+    "-1": 1214,
+    "1": 89
+  },
+  "class_counts_test": {
+    "-1": 249,
+    "1": 15
+  },
+  "dev_time_range": [
+    "2008-07-19T11:55:00",
+    "2008-10-04T23:18:00"
+  ],
+  "test_time_range": [
+    "2008-10-05T00:33:00",
+    "2008-10-17T06:07:00"
+  ],
+  "created_at": "2026-09-24T10:21:13.405295"
+}

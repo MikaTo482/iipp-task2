@@ -1,0 +1,10 @@
+{
+  "split_type": "random",
+  "random_seed": 42,
+  "test_size": 0.1,
+  "target_col": "label",
+  "n_total": 1567,
+  "n_dev": 1410,
+  "n_test": 157,
+  "created_at": "2026-09-24T10:21:36.346374"
+}
