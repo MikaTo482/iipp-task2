@@ -25,11 +25,16 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.feature_selection import SelectFromModel, mutual_info_classif
 from boruta import BorutaPy
 from itertools import combinations
+import shap
+
+SHAP_ENABLED = True
+SHAP_MAX_BACKGROUND = 100
 
 try:
     from xgboost import XGBClassifier
-except ImportError:
-    XGBClassifier = None
+except ImportError as e:
+    raise ImportError("XGBoost is required by the locked protocol "
+                      "(selector and model). Install with: pip install xgboost") from e
 
 TARGET_COL = "label"
 SPLIT_DIR = "splits"
@@ -70,10 +75,18 @@ MODEL_PARAMS = {
         "rf": dict(n_estimators=500, min_samples_leaf=1),
         "xgb": dict(n_estimators=300, max_depth=4, learning_rate=0.05, subsample=0.8,
                     colsample_bytree=0.8, eval_metric="logloss", tree_method="hist"),
-    }
-
+}
 
 def load_secom_data(data_path="secom/secom.data", label_path="secom/secom_labels.data"):
+    missing = [p for p in (data_path, label_path) if not os.path.isfile(p)]
+    if missing:
+        raise FileNotFoundError(
+            "SECOM file(s) not found:\n"
+            + "\n".join(f"  - {os.path.abspath(p)}" for p in missing)
+            + f"\nCurrent working directory: {os.getcwd()}"
+            + "\nPlease check the path."
+        )
+    
     X = pd.read_csv(data_path, sep=r"\s+", header=None)
     y = pd.read_csv(label_path, sep=r"\s+", header=None,
                     names=["label", "timestamp"])
@@ -83,14 +96,15 @@ def load_secom_data(data_path="secom/secom.data", label_path="secom/secom_labels
 
     df = pd.concat([X, y], axis=1)
     print(f"Loaded SECOM: {df.shape[0]} rows, {df.shape[1]} columns "
-          f"({X.shape[1]} features")
+          f"({X.shape[1]} features)")
     return df
 
 def load_protected_split(dev_path, test_path, config_path):
-    if not os.path.exists(dev_path):
-        raise FileNotFoundError(f"Not found: {dev_path} please run 03_protected_split.py first.")
-    elif not os.path.exists(test_path):
-        raise FileNotFoundError(f"Not found: {test_path} please run 03_protected_split.py first")
+    missing = [p for p in (dev_path, test_path, config_path) if not os.path.isfile(p)]
+    if missing:
+        raise FileNotFoundError(
+            "Split file(s) not found:\n" + "\n".join(f"  - {p}" for p in missing)
+            + "\nPlease run 03_protected_split.py first.")
 
     dev_idx = pd.read_csv(dev_path)["index"].to_numpy()
     test_idx = pd.read_csv(test_path)["index"].to_numpy()
@@ -228,11 +242,13 @@ def nogueira_stability(Z):
     s2 = M / (M - 1) * p_hat * (1 - p_hat)
     k_bar = Z.sum(axis=1).mean()
     denom = (k_bar / p) * (1 - k_bar / p)
+    if denom == 0:
+        return np.nan
     return 1 - s2.mean() / denom
 
 def kuncheva_index(subsets, p):
     k = len(subsets[0])
-    assert all(len(s) == k for s in subsets), "Kuncheva ต้องใช้ subset ขนาดเท่ากัน"
+    assert all(len(s) == k for s in subsets)
     assert 0 < k < p
     vals = [(len(set(a) & set(b)) * p - k**2) / (k * (p - k))
             for a, b in combinations(subsets, 2)]
@@ -273,13 +289,14 @@ def summarize_feature_stability(selections_df, feature_universe):
         rows.append(row)
 
         freq = selection_frequency(Z)
-        for feature, f in zip(feature_universe, freq):
+        counts = Z.sum(axis=0)
+        for feature, f, c in zip(feature_universe, freq, counts):
             freq_rows.append({
                 "imbalance": imbalance,
                 "selector": selector,
                 "feature": feature,
                 "selection_frequency": f,
-                "selected_count": int(f * len(subsets)),
+                "selected_count": int(c),
                 "n_runs": len(subsets),
             })
 
@@ -294,6 +311,47 @@ def summarize_feature_stability(selections_df, feature_universe):
     )
 
     return stability_df, feature_frequency_df
+
+# =========================================================================
+# SHAP - post-hoc explanation only (never used to build the stable feature set)
+# =========================================================================
+def _positive_class(sv):
+    if isinstance(sv, list):          
+        sv = sv[1]
+    sv = np.asarray(sv)
+    if sv.ndim == 3:                
+        sv = sv[..., 1]
+    return sv
+
+
+def compute_shap(model, model_name, X_background, X_explain, seed):
+    if model_name == "lr":
+        bg = X_background.sample(min(SHAP_MAX_BACKGROUND, len(X_background)),
+                                 random_state=seed)
+        explainer = shap.LinearExplainer(
+            model, shap.maskers.Independent(bg, max_samples=SHAP_MAX_BACKGROUND))
+        sv = explainer.shap_values(X_explain)
+        space = "log_odds"
+    elif model_name in ("rf", "xgb"):
+        explainer = shap.TreeExplainer(model)
+        sv = explainer.shap_values(X_explain, check_additivity=False)
+        space = "probability" if model_name == "rf" else "log_odds"
+    else:
+        raise ValueError(f"Unknown model: {model_name}")
+
+    sv = _positive_class(sv)
+    assert sv.shape == X_explain.shape, f"SHAP shape {sv.shape} != {X_explain.shape}"
+    return sv, space
+
+
+def shap_to_records(sv, features, space, **keys):
+    mean_abs = np.abs(sv).mean(axis=0)
+    mean_signed = sv.mean(axis=0)
+    ranks = pd.Series(mean_abs).rank(ascending=False, method="average").to_numpy()
+    return [{**keys, "feature": f, "mean_abs_shap": float(a), "mean_shap": float(s),
+             "shap_rank": float(r), "n_features_in_model": len(features),
+             "output_space": space}
+            for f, a, s, r in zip(features, mean_abs, mean_signed, ranks)]
 
 
 if __name__ == "__main__":
@@ -315,21 +373,19 @@ if __name__ == "__main__":
     # =========================================================================
     # TRACK A
     # =========================================================================
-    rskf = RepeatedStratifiedKFold(n_splits=N_SPLITS, n_repeats=N_REPEATS,
-                                   random_state=RANDOM_SEED)
 
-    results, selections = [], []
+    results, selections, shap_rows = [], [], []
     n_folds = N_SPLITS * N_REPEATS
     
     rskf = RepeatedStratifiedKFold(n_splits=N_SPLITS, n_repeats=N_REPEATS, random_state=RANDOM_SEED)
 
-    for fold_id, (tr, va) in enumerate(rskf.split(X, y)):
+    for fold_id, (tr, va) in enumerate(rskf.split(X, y), start=1):
         # seed = RANDOM_SEED + fold_id
         seed = RANDOM_SEED
-        repeat = fold_id // N_SPLITS + 1
+        repeat = (fold_id - 1) // N_SPLITS + 1
 
         X_train_processed, X_val_processed = preprocess_fold(X.iloc[tr], X.iloc[va])
-        y_train, y_val = y[tr], y[va]
+        y_train, y_val = y.iloc[tr], y.iloc[va]
 
         for imb in IMBALANCE:
             X_train_imb, y_train_imb, use_weight = apply_imbalance(X_train_processed, y_train, imb, seed)
@@ -366,8 +422,18 @@ if __name__ == "__main__":
                         "f1": f1_score(y_val, y_pred, zero_division=0),
                         "mcc": matthews_corrcoef(y_val, y_pred),
                     })
+                    if SHAP_ENABLED:
+                        sv, space = compute_shap(
+                            model, mdl,
+                            X_background=X_train_processed[features],   # ก่อน SMOTE
+                            X_explain=X_val_processed[features],
+                            seed=seed)
+                        shap_rows.extend(shap_to_records(
+                            sv, features, space,
+                            fold=fold_id, repeat=repeat, imbalance=imb,
+                            selector=selector, model=mdl))
 
-            print(f"fold {fold_id + 1}/{n_folds} done")
+        print(f"fold {fold_id}/{n_folds} done")
 
     # =========================================================================
     # Save results
@@ -399,12 +465,15 @@ if __name__ == "__main__":
         .sort_values("pr_auc_mean", ascending=False, ignore_index=True)
     )
 
+    shap_df = pd.DataFrame(shap_rows)
+
     for name, frame in (
         ("results", results_df),
         ("selections", selections_df),
         ("summary", summary_df),
         ("stability", stability_df),
         ("feature_frequency", feature_frequency_df),
+        ("shap", shap_df),  
     ):
         frame.to_json(
             os.path.join(RESULTS_DIR, f"{run_id}_{name}.json"),
@@ -413,8 +482,29 @@ if __name__ == "__main__":
             double_precision=15,
         )
 
+    config = {
+        "run_id": run_id, "random_seed": RANDOM_SEED,
+        "n_splits": N_SPLITS, "n_repeats": N_REPEATS,
+        "missing_threshold": MISSING_THRESHOLD,
+        "correlation_threshold": CORRELATION_THRESHOLD,
+        "selectors": SELECTORS, "imbalance": IMBALANCE, "models": MODELS,
+        "selector_params": SELECTOR_PARAMS, "model_params": MODEL_PARAMS,
+        "n_dev": len(dev_df), "n_features_original": len(feature_universe),
+        "positive_rate_dev": float(y.mean()),
+        "shap_enabled": SHAP_ENABLED,
+        "shap_explain_data": "validation_fold",
+        "shap_lr_background": "training_fold_before_smote",
+        "shap_max_background": SHAP_MAX_BACKGROUND,
+        "shap_version": shap.__version__,
+    }
+    with open(os.path.join(RESULTS_DIR, f"{run_id}_config.json"), "w") as f:
+        json.dump(config, f, indent=2)
+
     print(summary_df.round(3).to_string(index=False))
     print(stability_df.round(3).to_string(index=False))
+    print(feature_frequency_df.to_string(index=False))
+    print(shap_df.to_string(index=False))
+
 
 
 

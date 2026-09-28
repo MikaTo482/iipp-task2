@@ -147,9 +147,21 @@ if __name__ == "__main__":
     graph2_name = "missing_rate_histogram.png"
     graph3_name = "correlation_pairs_by_threshold.png"
 
-    X = pd.read_csv("secom/secom.data", sep=r"\s+", header=None)
+    data_path = "secom/secom.data"
+    label_path = "secom/secom_labels.data"
 
-    y = pd.read_csv("secom/secom_labels.data", sep=r"\s+", header=None,
+    missing = [p for p in (data_path, label_path) if not os.path.isfile(p)]
+    if missing:
+        raise FileNotFoundError(
+            "SECOM file(s) not found:\n"
+            + "\n".join(f"  - {os.path.abspath(p)}" for p in missing)
+            + f"\nCurrent working directory: {os.getcwd()}"
+            + "\nPlease check the path."
+        )
+
+    X = pd.read_csv(data_path, sep=r"\s+", header=None)
+
+    y = pd.read_csv(label_path, sep=r"\s+", header=None,
                                names=["label", "timestamp"])
 
     # ----------------------------------------------------------------------

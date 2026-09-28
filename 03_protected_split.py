@@ -38,6 +38,14 @@ TEST_TEMPORAL_PATH = os.path.join(SPLIT_DIR_TEMPORAL, "test_temporal.csv")
 # Load & Merge Data
 # =========================================================================
 def load_secom_data(data_path="secom/secom.data", label_path="secom/secom_labels.data"):
+    missing = [p for p in (data_path, label_path) if not os.path.isfile(p)]
+    if missing:
+        raise FileNotFoundError(
+            "SECOM file(s) not found:\n"
+            + "\n".join(f"  - {os.path.abspath(p)}" for p in missing)
+            + f"\nCurrent working directory: {os.getcwd()}"
+            + "\nPlease check the path."
+        )
     X = pd.read_csv(data_path, sep=r"\s+", header=None)
     y = pd.read_csv(label_path, sep=r"\s+", header=None,
                     names=["label", "timestamp"])
