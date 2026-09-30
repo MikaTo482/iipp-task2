@@ -126,29 +126,61 @@ def find_temporal_cutoff_candidates(cutoff_input, target_fail_counts=[15, 20, 25
 
     return candidates
 
-def correlation_filter(X, threshold=0.95):
-
-    if not 0 <= threshold <= 1:
-        raise ValueError("threshold have to be proportion format between 0 and 1")
-    if len(X) == 0:
-        raise ValueError("X data not found")
-    
-    corr_matrix = X.select_dtypes(include="number").corr().abs()
-    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-
-    pairs = upper.stack().reset_index()
-    pairs.columns = ["feature_1", "feature_2", "correlation"]
-    pairs = pairs[pairs["correlation"] >= threshold] \
-        .sort_values("correlation", ascending=False)
-
-    to_drop = set()
-    for f1, f2 in zip(pairs["feature_1"], pairs["feature_2"]):
-        if f1 in to_drop or f2 in to_drop:
-            continue
-        to_drop.add(f2)
-
-    print(len(to_drop), f"features have correlation >= {threshold}")
-    return list(to_drop)
+def correlation_filter(X, threshold=0.95, verbose=False):
+    """Remove highly correlated predictors (Kuhn & Johnson, 2013,
+    Applied Predictive Modeling, Section 3.5).
+ 
+    1) Calculate the absolute correlation matrix of the predictors.
+    2) Find the pair (A, B) with the largest absolute pairwise correlation.
+    3) Compute the average absolute correlation of A, and of B,
+       with the other predictors that are still retained.
+    4) Remove A if its average is larger; otherwise remove B.
+    Repeat until no absolute pairwise correlation is above the threshold.
+ 
+    Returns the list of feature names to drop.
+    """
+    if not 0 < threshold <= 1:
+        raise ValueError("threshold must be a proportion in (0, 1]")
+ 
+    num = X.select_dtypes(include="number")
+    if num.shape[0] == 0 or num.shape[1] == 0:
+        raise ValueError("X has no rows or no numeric columns")
+ 
+    # Step 1: absolute correlation matrix
+    corr = num.corr().abs()
+    names = corr.columns.to_numpy()
+    C = corr.to_numpy(copy=True)
+    np.fill_diagonal(C, np.nan)                 # ignore self-correlation
+ 
+    keep = np.ones(len(names), dtype=bool)      # True = predictor still retained
+    to_drop = []
+ 
+    while keep.sum() > 1:
+        idx = np.flatnonzero(keep)
+        sub = C[np.ix_(idx, idx)]
+        if np.isnan(sub).all():
+            break
+ 
+        # Step 2: pair with the largest |r| (ties -> first pair in column order)
+        i, j = np.unravel_index(np.nanargmax(sub), sub.shape)
+        if sub[i, j] < threshold:
+            break
+        a, b = idx[i], idx[j]
+ 
+        # Step 3: average |r| with the predictors that are still retained
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            mean_a = np.nanmean(C[a, idx])
+            mean_b = np.nanmean(C[b, idx])
+ 
+        # Step 4: remove A if its average is larger, otherwise remove B
+        drop = a if mean_a > mean_b else b
+        keep[drop] = False
+        to_drop.append(names[drop])
+ 
+    if verbose:
+        print(f"{len(to_drop)} features removed (|r| > {threshold})")
+    return to_drop
 
 
 def missing_rate_filter(X, threshold):

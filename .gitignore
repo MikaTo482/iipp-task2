@@ -4,3 +4,4 @@ Paper
 catboost_info
 venv
 .venv
+experiments/*_shap.json

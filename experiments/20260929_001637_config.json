@@ -1,0 +1,70 @@
+{
+  "run_id": "20260929_001637",
+  "random_seed": 42,
+  "n_splits": 5,
+  "n_repeats": 10,
+  "missing_threshold": 50,
+  "correlation_threshold": 0.95,
+  "selectors": [
+    "none",
+    "mi",
+    "l1",
+    "xgb",
+    "boruta"
+  ],
+  "imbalance": [
+    "none",
+    "weight",
+    "smote"
+  ],
+  "models": [
+    "lr",
+    "rf",
+    "xgb"
+  ],
+  "selector_params": {
+    "mi": {
+      "top_k": 20
+    },
+    "l1": {
+      "C": 0.1
+    },
+    "xgb": {
+      "top_k": 20,
+      "n_estimators": 300,
+      "max_depth": 3,
+      "learning_rate": 0.05
+    },
+    "boruta": {
+      "max_iter": 100,
+      "rf_max_depth": 5
+    }
+  },
+  "model_params": {
+    "lr": {
+      "C": 1.0,
+      "max_iter": 5000
+    },
+    "rf": {
+      "n_estimators": 500,
+      "min_samples_leaf": 1
+    },
+    "xgb": {
+      "n_estimators": 300,
+      "max_depth": 4,
+      "learning_rate": 0.05,
+      "subsample": 0.8,
+      "colsample_bytree": 0.8,
+      "eval_metric": "logloss",
+      "tree_method": "hist"
+    }
+  },
+  "n_dev": 1410,
+  "n_features_original": 590,
+  "positive_rate_dev": 0.06666666666666667,
+  "shap_enabled": true,
+  "shap_explain_data": "validation_fold",
+  "shap_lr_background": "training_fold_before_smote",
+  "shap_max_background": 100,
+  "shap_version": "0.51.0"
+}
