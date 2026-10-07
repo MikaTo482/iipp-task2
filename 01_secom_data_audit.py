@@ -109,6 +109,40 @@ def audit_correlation_structure(X):
     return result, upper, pairs_by_threshold
 
 
+# ----------------------------------------------------------------------
+# Distribution shape audit (skewness, extreme outliers, scale spread)
+# ----------------------------------------------------------------------
+
+def audit_distribution_shape(X, missing_threshold=50, outlier_iqr_k=3.0):
+    # same feature space as the preprocessing: drop features with more than
+    # missing_threshold % missing values and features that are constant
+    miss_rate = X.isna().mean() * 100
+    X_kept = X.loc[:, miss_rate <= missing_threshold]
+    X_kept = X_kept.loc[:, X_kept.nunique(dropna=True) > 1]
+
+    skewness = X_kept.skew()
+
+    q1 = X_kept.quantile(0.25)
+    q3 = X_kept.quantile(0.75)
+    iqr = q3 - q1
+    is_outlier = (X_kept < q1 - outlier_iqr_k * iqr) | (X_kept > q3 + outlier_iqr_k * iqr)
+    has_outlier = is_outlier.sum() > 0
+
+    std = X_kept.std()
+
+    n = X_kept.shape[1]
+    result = {
+        "n_features_analysed": n,
+        "abs_skew_gt_1": int((skewness.abs() > 1).sum()),
+        "abs_skew_gt_1_pct": round((skewness.abs() > 1).mean() * 100, 1),
+        f"has_outlier_{outlier_iqr_k}xIQR": int(has_outlier.sum()),
+        f"has_outlier_{outlier_iqr_k}xIQR_pct": round(has_outlier.mean() * 100, 1),
+        "std_min": float(std.min()),
+        "std_median": float(std.median()),
+        "std_max": float(std.max()),
+    }
+    return result
+
 # ======================================================================
 # Main execution (runs only when this file is executed directly,
 # not when another script imports functions from it)
@@ -219,6 +253,13 @@ if __name__ == "__main__":
     correlation_summary, upper_matrix, pairs_by_threshold = audit_correlation_structure(X)
 
     # ----------------------------------------------------------------------
+    # Distribution Shape Audit
+    # ----------------------------------------------------------------------
+
+    distribution_shape = audit_distribution_shape(X, missing_threshold=50, outlier_iqr_k=3.0)
+    print("Distribution shape:", distribution_shape)
+
+    # ----------------------------------------------------------------------
     # Generate a report and save it to a text file
     # ----------------------------------------------------------------------
 
@@ -240,6 +281,8 @@ Near-zero variance features:\n
 the number of exact duplicate features: {len(duplicate_feature_ids)}\n
 Exact duplicate features:\n
 {duplicate_feature_ids}\n
+Distribution Shape (features with <= 50% missing, non-constant):\n
+{pd.Series(distribution_shape).to_string()}\n
 Correlation Summary:\n
 the number of correlation pairs by threshold:\n
 {correlation_summary}\n

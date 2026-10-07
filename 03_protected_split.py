@@ -10,18 +10,10 @@ try:
     from xgboost import XGBClassifier
 except ImportError:
     XGBClassifier = None
-try:
-    from lightgbm import LGBMClassifier
-except ImportError:
-    LGBMClassifier = None
-try:
-    from catboost import CatBoostClassifier
-except ImportError:
-    CatBoostClassifier = None
 
 RANDOM_SEED = 42
 TARGET_COL = "label"
-TEST_SIZE = 0.10
+TEST_SIZE = 0.2
 
 SPLIT_DIR = "splits"
 SPLIT_DIR_RANDOM  = os.path.join(SPLIT_DIR, "random")
