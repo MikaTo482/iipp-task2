@@ -2,6 +2,9 @@
 
 เก็บโค้ด unit test และ regression test ของโปรเจกต์ไว้ในโฟลเดอร์นี้
 
+- `test_boyer_moore_majority.py`: ตรวจอัลกอริทึม Boyer–Moore ดั้งเดิมที่รับ array หนึ่งมิติ คืน majority หนึ่งค่า หรือ `None` เมื่อไม่มีค่าใดเกินครึ่ง
+- `test_vote_scores.py`: ตรวจการส่งเสียง 0/1 ของแต่ละฟีเจอร์เข้า Boyer–Moore โดยตรง, กรณีเสมอ และการส่งพารามิเตอร์ใน `04_experiment_workflow.py` โดย import script โดยไม่เริ่ม experiment loop
+- `test_experiment_workflow_timing.py`: ตรวจการบันทึกและสรุปเวลา รวมถึงกรณีไม่เลือกฟีเจอร์ ใน `04_experiment_workflow.py`
 - `test_track_evaluation_stability.py`: ตรวจ Nogueira, Kuncheva, feature universe และการบันทึกผลของ `04_track_evaluation.py`
 - `test_track_evaluation_shap.py`: ตรวจ SHAP ของ KNN/NB เทียบกับสูตร Shapley แบบไล่ครบทุกชุดบนข้อมูลจำลองขนาดเล็ก, คลาส Fail, seed, additivity, สถานะล้มเหลว และการบันทึก JSON ผ่าน loop จริง
 - `test_visualize_result.py`: ตรวจกราฟ basic ใน `05_visualize_result.py` ครอบคลุมค่าที่อ่านจาก JSON, การแบ่งหน้ากราฟ, ค่า NA, ชื่อยาว และความเหมือนกันของผลเมื่อรันซ้ำ
@@ -15,6 +18,7 @@
 รันเฉพาะชุด:
 
 ```sh
+.venv/bin/python -m unittest tests.test_boyer_moore_majority tests.test_vote_scores tests.test_experiment_workflow_timing -v
 .venv/bin/python -m unittest tests.test_track_evaluation_stability -v
 .venv/bin/python -m unittest tests.test_track_evaluation_shap -v
 .venv/bin/python -m unittest tests.test_visualize_result -v

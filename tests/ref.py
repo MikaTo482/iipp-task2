@@ -8,8 +8,7 @@ from sklearn.feature_selection import VarianceThreshold, SelectFromModel, mutual
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler, RobustScaler
-from utils import (missing_rate_filter, correlation_filter, 
-                   duplicate_filter,  VotingFeatureSelector)
+from utils import missing_rate_filter, correlation_filter, duplicate_filter
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import (RandomForestClassifier, AdaBoostClassifier, 
                               GradientBoostingClassifier)

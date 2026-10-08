@@ -6,17 +6,17 @@ from datetime import datetime
 import time
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.model_selection import RepeatedStratifiedKFold
-from sklearn.feature_selection import VarianceThreshold, SelectFromModel, mutual_info_classif, RFE, SelectKBest, SelectFdr, f_classif
+from sklearn.feature_selection import VarianceThreshold, SelectFromModel, mutual_info_classif, RFECV, SelectKBest, SelectFdr, f_classif
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import RobustScaler
-from utils import (missing_rate_filter, 
-                   correlation_filter, 
-                   duplicate_filter)
+from utils import missing_rate_filter, correlation_filter, duplicate_filter
+
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (matthews_corrcoef, recall_score, confusion_matrix, 
                              average_precision_score, precision_score)
+from sklearn.svm import LinearSVC                 
 from imblearn.over_sampling import SMOTE
 from boruta import BorutaPy
 from itertools import combinations
@@ -44,7 +44,7 @@ SPLIT_CONFIG_PATH_TEMPORAL = os.path.join(SPLIT_DIR_TEMPORAL, "split_config.json
 TEST_TEMPORAL_PATH = os.path.join(SPLIT_DIR_TEMPORAL, "test_temporal.csv")
 
 N_SPLITS = 5
-N_REPEATS = 10
+N_REPEATS = 30
 N_JOBS = 1
 
 RANDOM_SEED = 42
@@ -55,19 +55,8 @@ MISSING_THRESHOLD = 50
 USE_CORRELATION_FILTER = True
 CORRELATION_THRESHOLD = 0.8
 
-N_SPLITS = 5
-N_REPEATS = 30
-N_JOBS = 1
-
 def resampling_seed(fold_id):
     return RANDOM_SEED + fold_id
-
-SELECTOR_PARAMS = {
-    "mi": dict(top_k=20),
-    "l1": dict(C=0.1),
-    "xgb": dict(top_k=20, n_estimators=300, max_depth=3, learning_rate=0.05),
-    "boruta": dict(max_iter=100, rf_max_depth=5),
-}
 
 MODEL_PARAMS = {
         "lr": dict(C=1.0, max_iter=5000),
@@ -128,6 +117,28 @@ def apply_imbalance(X, y, condition, seed):
         return X_res, np.asarray(y_res), False
     return X, y, condition == "weight"
 
+
+# --------------------------------------------------------------------------
+# Selectors (single source of truth for the experiment AND the voters).
+# Every selector returns exactly k column labels of X for each k in K_VALUES
+# (fixed-k protocol), except "none", which keeps all features as the
+# all-feature reference and is recorded with k = <NA>.
+# --------------------------------------------------------------------------
+K_VALUES = [10, 20, 30]
+
+SELECTOR_PARAMS = {
+    "mi": dict(rank_by="mutual_information"),
+    "anova": dict(rank_by="f_statistic"),
+    # Smallest C on this grid that gives >= k non-zero coefficients, then top-k by |coef|.
+    "l1": dict(C_grid=np.round(np.logspace(-3, 2, 26), 6).tolist()),
+    "xgb": dict(n_estimators=300, max_depth=3, learning_rate=0.05),
+    # Rank by Boruta ranking_ (1 = confirmed); ties broken by RF importance.
+    "boruta": dict(max_iter=100, rf_max_depth=5, tie_break_n_estimators=500),
+    # Top-k by number of votes; ties broken by mean rank inside the voters' top-k lists.
+    "vote": dict(methods=None, tie_break="mean_rank"),
+}
+
+
 def compute_scale_pos_weight(y):
     y = np.asarray(y)
     n_pos = np.sum(y == 1)
@@ -138,24 +149,63 @@ def compute_scale_pos_weight(y):
 
     return n_neg / n_pos
 
-def select_features(name, X, y, use_weights, seed):
+
+def select_features_multi(name, X, y, use_weights, seed, k_values=None, n_jobs=None):
+    """Return {k: top-k column labels} for every k in k_values.
+
+    The selector is fitted once and the ranking is sliced per k, so expensive
+    selectors (Boruta, vote) do not run once per k. Only L1 depends on k
+    (C is searched until >= k coefficients are non-zero), so it refits per k.
+    """
+    if n_jobs is None:
+        n_jobs = N_JOBS
     cols = X.columns
+    k_values = K_VALUES if k_values is None else list(k_values)
+    if not k_values or any(int(k) < 1 for k in k_values):
+        raise ValueError(f"k_values must be positive integers, got {k_values!r}.")
+    ks = {int(k): min(int(k), len(cols)) for k in k_values}  # requested k -> usable k
     cw = "balanced" if use_weights else None
     P = SELECTOR_PARAMS.get(name, {})
- 
-    if name == "none":                  # all-feature reference (RQ1)
-        return list(cols)
- 
-    if name == "mi":                    # no weighting option -> 'weight' == 'none'
-        scores = mutual_info_classif(X, y, random_state=seed)
-        return list(cols[np.argsort(scores)[::-1][:P["top_k"]]])
- 
+
+    def from_order(order):
+        return {k: list(cols[order[:kk]]) for k, kk in ks.items()}
+
+    def from_scores(scores):
+        scores = np.nan_to_num(np.asarray(scores, dtype=float), nan=-np.inf)
+        return from_order(np.argsort(-scores, kind="stable"))  # ties keep column order
+
+    if name == "mi":
+        return from_scores(mutual_info_classif(X, y, random_state=seed))
+
+    if name == "anova":
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)  # constant columns -> NaN F
+            scores, _ = f_classif(X, y)
+        return from_scores(scores)
+
     if name == "l1":
-        m = LogisticRegression(penalty="l1", solver="liblinear", C=P["C"],
-                               class_weight=cw, max_iter=5000, random_state=seed)
-        m.fit(X, y)
-        return list(cols[np.abs(m.coef_[0]) > 1e-8])
-    
+        out = {}
+        for k, kk in ks.items():
+            coef = None
+            for C in P["C_grid"]:
+                model = LogisticRegression(
+                    penalty="l1",
+                    solver="liblinear",
+                    C=C,
+                    class_weight=cw,
+                    max_iter=5000,
+                    random_state=seed,
+                )
+                model.fit(X, y)
+                coef = np.abs(model.coef_[0])
+                if np.count_nonzero(coef > 1e-8) >= kk:
+                    break
+            else:
+                warnings.warn(f"l1: only {np.count_nonzero(coef > 1e-8)} non-zero coefficients "
+                              f"at the largest C; padding to k={kk} by column order.")
+            out[k] = from_scores(coef)[k]
+        return out
+
     if name == "xgb":
         xgb_params = dict(
             n_estimators=P["n_estimators"],
@@ -163,24 +213,111 @@ def select_features(name, X, y, use_weights, seed):
             learning_rate=P["learning_rate"],
             eval_metric="aucpr",
             random_state=seed,
-            n_jobs=N_JOBS,
+            n_jobs=n_jobs,
         )
 
         if use_weights:
             xgb_params["scale_pos_weight"] = compute_scale_pos_weight(y)
 
-        m = XGBClassifier(**xgb_params)
-        m.fit(X, y)
-        return list(cols[np.argsort(m.feature_importances_)[::-1][:P["top_k"]]])
- 
+        model = XGBClassifier(**xgb_params)
+        model.fit(X, y)
+        return from_scores(model.feature_importances_)
+
     if name == "boruta":
         rf = RandomForestClassifier(max_depth=P["rf_max_depth"], class_weight=cw,
-                                    random_state=seed, n_jobs=N_JOBS)
+                                    random_state=seed, n_jobs=n_jobs)
         b = BorutaPy(rf, n_estimators="auto", max_iter=P["max_iter"], random_state=seed)
         b.fit(X.to_numpy(), y)
-        return list(cols[b.support_])
- 
+        # BorutaPy re-sizes and refits rf on shadow features, so use a fresh forest
+        # with the same settings to order features that share a Boruta rank.
+        tie_rf = RandomForestClassifier(n_estimators=P["tie_break_n_estimators"],
+                                        max_depth=P["rf_max_depth"], class_weight=cw,
+                                        random_state=seed, n_jobs=n_jobs)
+        importance = tie_rf.fit(X, y).feature_importances_
+        return from_order(np.lexsort((np.arange(len(cols)), -importance, b.ranking_)))
+
+    if name == "vote":
+        results = vote_scores(X, y, use_weights, seed, methods=P["methods"],
+                              k_values=list(ks), n_jobs=n_jobs)
+        return {k: list(cols[r["support"].to_numpy()]) for k, r in results.items()}
+
     raise ValueError(f"Unknown selector: {name}")
+
+
+def select_features(name, X, y, use_weights, seed, n_jobs=None, k=None):
+    """Single-k convenience wrapper around select_features_multi."""
+    k = K_VALUES[0] if k is None else int(k)
+    return select_features_multi(name, X, y, use_weights, seed, k_values=[k], n_jobs=n_jobs)[k]
+
+
+# Every real selector can vote. "none" keeps all features (it would give every
+# feature a free vote) and "vote" is the ensemble itself, so neither is a voter.
+VOTERS = tuple(m for m in SELECTOR_PARAMS if m not in ("none", "vote"))
+
+
+def vote_scores(X, y, use_weights, seed, methods=None, k_values=None, n_jobs=None):
+    """Fixed-k vote for every k: each voter submits its top-k, the ensemble keeps top-k by votes.
+
+    Every voter is fitted once (select_features_multi) and reused for all k.
+    Ties in vote count are broken by mean rank: a feature at position r in a
+    voter's top-k list gets rank r, a feature the voter did not pick gets rank k.
+    Remaining ties keep column order, so the result is deterministic.
+
+    Returns {k: dict(scores, votes, mean_rank, selected_by, weights, support)},
+    where support is a bool Series with exactly min(k, n_features) True values.
+    """
+    if n_jobs is None:
+        n_jobs = N_JOBS
+    if not isinstance(X, pd.DataFrame):
+        raise TypeError("X must be a pandas DataFrame with unique feature names.")
+    if X.empty or not X.columns.is_unique:
+        raise ValueError("X must have rows and uniquely named feature columns.")
+    if isinstance(methods, str):
+        raise TypeError("methods must be a sequence of voter names, not a string.")
+    methods = VOTERS if methods is None else tuple(methods)
+    if not methods:
+        raise ValueError("methods must contain at least one voter.")
+    unknown = [m for m in methods if m not in VOTERS]
+    if unknown:
+        raise ValueError(f"Unknown voter(s) {unknown}. Choose from {list(VOTERS)}.")
+    if len(set(methods)) != len(methods):
+        raise ValueError(f"Duplicate voter names in {methods}; each voter must vote once.")
+    k_values = K_VALUES if k_values is None else list(k_values)
+
+    ballots = {name: select_features_multi(name, X, y, use_weights, seed,
+                                           k_values=k_values, n_jobs=n_jobs)
+               for name in methods}
+
+    p = X.shape[1]
+    out = {}
+    for k in k_values:
+        k = int(k)
+        kk = min(k, p)
+        votes = np.zeros(p, dtype=int)
+        rank_sum = np.zeros(p, dtype=float)
+        selected_by = {}
+        for name in methods:
+            picked = list(ballots[name][k])
+            positions = X.columns.get_indexer(picked)  # position of each picked name in X
+            if (positions < 0).any() or len(set(picked)) != len(picked):
+                raise ValueError(f"Voter {name!r} returned duplicate names or names outside X.columns.")
+            selected_by[name] = picked
+            rank = np.full(p, float(kk))
+            rank[positions] = np.arange(len(picked))
+            votes[positions] += 1
+            rank_sum += rank
+
+        mean_rank = rank_sum / len(methods)
+        order = np.lexsort((np.arange(p), mean_rank, -votes))
+        support = np.zeros(p, dtype=bool)
+        support[order[:kk]] = True
+        out[k] = {"scores": pd.Series(votes / len(methods), index=X.columns),
+                  "votes": pd.Series(votes, index=X.columns),
+                  "mean_rank": pd.Series(mean_rank, index=X.columns),
+                  "selected_by": selected_by,
+                  "weights": {name: 1.0 for name in methods},
+                  "support": pd.Series(support, index=X.columns)}
+    return out
 
 def build_model(name, seed):
     P = MODEL_PARAMS[name]
@@ -284,7 +421,7 @@ def kuncheva_index(subsets, p):
         return np.nan
     k = len(subsets[0])
     if not all(len(s) == k for s in subsets) or not 0 < k < p:
-        raise ValueError("Kuncheva requires equal subset sizes with 0 < k < p")
+        return np.nan
     vals = [(len(set(a) & set(b)) * p - k**2) / (k * (p - k))
             for a, b in combinations(subsets, 2)]
     return np.mean(vals)
@@ -303,7 +440,8 @@ def summarize_feature_stability(selections_df, feature_universe):
     freq_rows = []
     d = len(feature_universe)
 
-    for (imbalance, selector), g in selections_df.groupby(["imbalance", "selector"]):
+    # dropna=False keeps "none" (k = <NA>) as its own group.
+    for (imbalance, selector, k), g in selections_df.groupby(["imbalance", "selector", "k"], dropna=False):
         subsets = g["features"].tolist()
         Z = to_matrix_from_names(subsets, feature_universe)
 
@@ -313,6 +451,7 @@ def summarize_feature_stability(selections_df, feature_universe):
         rows.append({
             "imbalance": imbalance,
             "selector": selector,
+            "k": k,
             "n_runs": len(subsets),
             "n_features_mean": subset_sizes.mean(),
             "n_features_std": subset_sizes.std(ddof=1) if len(subset_sizes) > 1 else 0,
@@ -332,6 +471,7 @@ def summarize_feature_stability(selections_df, feature_universe):
             freq_rows.append({
                 "imbalance": imbalance,
                 "selector": selector,
+                "k": k,
                 "feature": feature,
                 "selection_frequency": f,
                 "selected_count": int(c),
@@ -340,19 +480,19 @@ def summarize_feature_stability(selections_df, feature_universe):
                 "frequency_when_available": c / a if a > 0 else np.nan,
             })
 
-    stability_df = pd.DataFrame(rows).sort_values(
-        ["imbalance", "selector"], ignore_index=True
+    stability_df = pd.DataFrame(rows).astype({"k": "Int64"}).sort_values(
+        ["imbalance", "selector", "k"], ignore_index=True
     )
 
-    feature_frequency_df = pd.DataFrame(freq_rows).sort_values(
-        ["imbalance", "selector", "selection_frequency"],
-        ascending=[True, True, False],
+    feature_frequency_df = pd.DataFrame(freq_rows).astype({"k": "Int64"}).sort_values(
+        ["imbalance", "selector", "k", "selection_frequency"],
+        ascending=[True, True, True, False],
         ignore_index=True,
     )
 
     return stability_df, feature_frequency_df
 
-SELECTORS = ["none", "mi", "l1", "xgb", "boruta"]
+SELECTORS = ["none", "mi", "anova", "l1", "xgb", "boruta", "vote"]
 IMBALANCE = ["none", "weight", "smote"]
 MODELS = ["lr", "rf", "xgb"]
 
@@ -396,58 +536,66 @@ if __name__ == "__main__":
 
             for selector in SELECTORS:
                 t0 = time.perf_counter()
-                features = select_features(selector, X_train_imb, y_train_imb, use_weight, seed)
+                if selector == "none":
+                    subsets = {None: list(X_train_imb.columns)}   # all features, no k
+                else:
+                    subsets = select_features_multi(selector, X_train_imb, y_train_imb,
+                                                    use_weight, seed, k_values=K_VALUES)
+                # One fit serves every k, so this time is shared by all k of this selector.
                 selection_time = time.perf_counter() - t0
-                selections.append({
-                    "fold": fold_id,
-                    "repeat": repeat,
-                    "imbalance": imb,
-                    "selector": selector,
-                    "n_features_after_preprocessing": X_train_processed.shape[1],
-                    "candidate_features": list(X_train_processed.columns), 
-                    "n_features_selected": len(features),
-                    "features": features,
-                    "selection_time(s)": selection_time
-                })
-                if not features:
-                    print(f"  [warning] fold {fold_id} {imb}|{selector}: no features selected")
-                    for mdl in MODELS:
-                        results.append({"fold": fold_id, "repeat": repeat, "imbalance": imb,
-                                        "selector": selector, "model": mdl, "n_features": 0,
-                                        "fit_time(s)": np.nan,"fit_time(ms)": np.nan, "predict_time(s)": np.nan,
-                                        "predict_time(ms)": np.nan,
-                                        "predict_time_per_observation(ms)": np.nan,
-                                        "ap": np.nan, "recall": np.nan, "precision": np.nan,
-                                        "tn": np.nan, "fp": np.nan, "fn": np.nan, "tp": np.nan})
-                    continue
 
-                for mdl in MODELS:
-                    model = build_model(mdl, seed)
-
-                    t0 = time.perf_counter()
-                    model.fit(X_train_imb[features], y_train_imb)
-                    fit_time = time.perf_counter() - t0
-
-                    t0 = time.perf_counter()
-                    y_proba = model.predict_proba(X_val_processed[features])[:, 1]
-                    predict_time = time.perf_counter() - t0
-
-                    y_pred = (y_proba >= DECISION_THRESHOLD).astype(int)
-                    conf_list = confusion_matrix(y_val, y_pred, labels=[0, 1]).ravel().tolist()  # [TN, FP, FN, TP]
-                    tn, fp, fn, tp = conf_list
-                    results.append({
-                        "fold": fold_id, "repeat": repeat, "imbalance": imb,
-                        "selector": selector, "model": mdl, "n_features": len(features),
-                        "fit_time(s)": fit_time,
-                        "fit_time(ms)": fit_time * 1000,
-                        "predict_time(s)": predict_time,
-                        "predict_time(ms)": predict_time * 1000,
-                        "predict_time_per_observation(ms)": predict_time / len(y_val) * 1000,
-                        "ap": average_precision_score(y_val, y_proba),   # primary metric
-                        "recall": recall_score(y_val, y_pred, zero_division=0),
-                        "precision": precision_score(y_val, y_pred, zero_division=0),
-                        "tn": tn, "fp": fp, "fn": fn, "tp": tp,
+                for k, features in subsets.items():
+                    selections.append({
+                        "fold": fold_id,
+                        "repeat": repeat,
+                        "imbalance": imb,
+                        "selector": selector,
+                        "k": k,
+                        "n_features_after_preprocessing": X_train_processed.shape[1],
+                        "candidate_features": list(X_train_processed.columns),
+                        "n_features_selected": len(features),
+                        "features": features,
+                        "selection_time(s)": selection_time
                     })
+                    if not features:
+                        print(f"  [warning] fold {fold_id} {imb}|{selector}|k={k}: no features selected")
+                        for mdl in MODELS:
+                            results.append({"fold": fold_id, "repeat": repeat, "imbalance": imb,
+                                            "selector": selector, "k": k, "model": mdl, "n_features": 0,
+                                            "fit_time(s)": np.nan,"fit_time(ms)": np.nan, "predict_time(s)": np.nan,
+                                            "predict_time(ms)": np.nan,
+                                            "predict_time_per_observation(ms)": np.nan,
+                                            "ap": np.nan, "recall": np.nan, "precision": np.nan,
+                                            "tn": np.nan, "fp": np.nan, "fn": np.nan, "tp": np.nan})
+                        continue
+
+                    for mdl in MODELS:
+                        model = build_model(mdl, seed)
+
+                        t0 = time.perf_counter()
+                        model.fit(X_train_imb[features], y_train_imb)
+                        fit_time = time.perf_counter() - t0
+
+                        t0 = time.perf_counter()
+                        y_proba = model.predict_proba(X_val_processed[features])[:, 1]
+                        predict_time = time.perf_counter() - t0
+
+                        y_pred = (y_proba >= DECISION_THRESHOLD).astype(int)
+                        conf_list = confusion_matrix(y_val, y_pred, labels=[0, 1]).ravel().tolist()  # [TN, FP, FN, TP]
+                        tn, fp, fn, tp = conf_list
+                        results.append({
+                            "fold": fold_id, "repeat": repeat, "imbalance": imb,
+                            "selector": selector, "k": k, "model": mdl, "n_features": len(features),
+                            "fit_time(s)": fit_time,
+                            "fit_time(ms)": fit_time * 1000,
+                            "predict_time(s)": predict_time,
+                            "predict_time(ms)": predict_time * 1000,
+                            "predict_time_per_observation(ms)": predict_time / len(y_val) * 1000,
+                            "ap": average_precision_score(y_val, y_proba),   # primary metric
+                            "recall": recall_score(y_val, y_pred, zero_division=0),
+                            "precision": precision_score(y_val, y_pred, zero_division=0),
+                            "tn": tn, "fp": fp, "fn": fn, "tp": tp,
+                        })
 
         print(f"fold {fold_id}/{n_folds} done at {datetime.now().isoformat()}")
         total_time = datetime.now() - start_time
@@ -459,8 +607,9 @@ if __name__ == "__main__":
     print(f"Experiment took {total_exp_time.total_seconds():.1f} seconds")
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_df = pd.DataFrame(results)
-    selections_df = pd.DataFrame(selections)
+    # k is an integer, or <NA> for "none" (all features); Int64 keeps 10/20/30 as ints in JSON.
+    results_df = pd.DataFrame(results).astype({"k": "Int64"})
+    selections_df = pd.DataFrame(selections).astype({"k": "Int64"})
     removed_features_df = pd.DataFrame.from_dict(removed_features, orient="index").reset_index().rename(columns={"index": "fold"})
 
     feature_universe = sorted(set().union(*selections_df["candidate_features"]))
@@ -469,19 +618,21 @@ if __name__ == "__main__":
             selections_df,
             feature_universe,
     )
+    def nanmean(s):
+        return s.mean(skipna=True)
 
     summary_df = (
-        results_df.groupby(["imbalance", "selector", "model"])
+        results_df.groupby(["imbalance", "selector", "k", "model"], dropna=False)
         .agg(
-            average_precision_mean=("ap", "mean"),
+            average_precision_mean=("ap", nanmean),
             average_precision_std=("ap", "std"),
-            recall_mean=("recall", "mean"),
-            precision_mean=("precision", "mean"),
-            tn_mean=("tn", "mean"),
-            fp_mean=("fp", "mean"),
-            fn_mean=("fn", "mean"),
-            tp_mean=("tp", "mean"),
-            n_features_mean=("n_features", "mean"),
+            recall_mean=("recall", nanmean),
+            precision_mean=("precision", nanmean),
+            tn_mean=("tn", nanmean),
+            fp_mean=("fp", nanmean),
+            fn_mean=("fn", nanmean),
+            tp_mean=("tp", nanmean),
+            n_features_mean=("n_features", nanmean),
         )
         .reset_index()
         .sort_values("average_precision_mean", ascending=False, ignore_index=True)
@@ -492,12 +643,12 @@ if __name__ == "__main__":
     def q3(s): return s.quantile(0.75)
 
     selection_time_df = (
-        selections_df.groupby(["imbalance", "selector"])["selection_time(s)"]
+        selections_df.groupby(["imbalance", "selector", "k"], dropna=False)["selection_time(s)"]
         .agg(selection_time_median="median", selection_time_q1=q1, selection_time_q3=q3)
         .reset_index()
     )
     model_time_df = (
-        results_df.groupby(["imbalance", "selector", "model"])
+        results_df.groupby(["imbalance", "selector", "k", "model"], dropna=False)
         .agg(fit_time_median=("fit_time(s)", "median"),
              fit_time_q1=("fit_time(s)", q1),
              fit_time_q3=("fit_time(s)", q3),
@@ -531,6 +682,10 @@ if __name__ == "__main__":
             "stability_feature_universe": feature_universe,
             "missing_threshold": MISSING_THRESHOLD,
             "correlation_threshold": CORRELATION_THRESHOLD,
+            "k_values": K_VALUES,
+            "k_note": "k is <NA> for selector 'none' (all features). selection_time is "
+                      "measured once per fold/imbalance/selector and shared by every k, "
+                      "because one selector fit is sliced to all k values.",
             "selectors": SELECTORS, "imbalance": IMBALANCE, "models": MODELS,
             "selector_params": SELECTOR_PARAMS, "model_params": MODEL_PARAMS,
             "scaler": "RobustScaler",
@@ -547,4 +702,3 @@ if __name__ == "__main__":
 
 
         
-
