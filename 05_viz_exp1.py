@@ -1,10 +1,17 @@
 """Reproduce experiment figures from saved JSON without running model fits.
 
 Run with --run-id to select an experiment and --out-dir to change the destination.
+Threshold comparison curves use the full saved grid.
+Use --list-options to see choices, --plots to choose figures, and --selectors,
+--exclude-selectors, --models, or --imbalances to choose displayed results.
+Customized views are saved in separate view folders to avoid mixing outputs.
+RQ4 plots imbalance_ap and imbalance_stability retain the no-handling reference
+even when --imbalances displays only weight or smote.
 Importing this module does not load experiments or create output files.
 """
 
 import argparse
+import hashlib
 import json
 import textwrap
 from pathlib import Path
@@ -17,6 +24,23 @@ from matplotlib.ticker import PercentFormatter, FixedLocator, FormatStrFormatter
 
 BASE_DIR = Path(__file__).resolve().parent / "experiments"
 RUN_ID = None
+# Set lists here for normal script runs, or override them with command-line options.
+PLOTS_TO_SHOW = None
+SELECTORS_TO_SHOW = None
+SELECTORS_TO_HIDE = ["vote"]
+MODELS_TO_SHOW = None
+IMBALANCES_TO_SHOW = None
+PLOT_LABELS = {
+    "tradeoff": "Average precision versus feature count",
+    "ap_difference": "AP change from all features",
+    "stability": "Feature selection stability",
+    "feature_frequency": "Most frequently selected features",
+    "heatmap": "Performance, reduction and stability heatmap",
+    "imbalance_ap": "AP change from imbalance handling",
+    "imbalance_stability": "Stability and feature counts under imbalance handling",
+    "thresholds": "Recall and precision versus decision threshold",
+    "timing": "Training and prediction times",
+}
 REQUIRED_TABLES = ("config", "results", "summary", "stability", "feature_frequency")
 PLOT_STYLE = {
     "font.family": "DejaVu Sans",
@@ -35,7 +59,7 @@ SELECTOR_STYLES = {
     "l1": ("L1 logistic regression", "#E69F00", "s"),
     "xgb": ("XGBoost selector", "#009E73", "^"),
     "boruta": ("Boruta", "#CC79A7", "P"),
-    "vote": ("Voting", "#D55E00", "*")
+    "vote": ("Voting", "#D55E00", "*"),
 }
 
 MODEL_LABELS = {
@@ -59,7 +83,6 @@ IMBALANCE_MARKERS = {"none": "o", "weight": "s", "smote": "^"}
 STABILITY_METRICS = {
     "nogueira": "Nogueira stability",
     "mean_jaccard": "Mean Jaccard similarity",
-    "kuncheva": "Kuncheva index",
 }
 FIGURE_TITLE = "Average precision, feature count and selection stability"
 TIME_METRICS = {
@@ -122,7 +145,7 @@ def add_figure_legends(fig, selectors, secondary=(), note=None):
     bottom = 0.15
     if note:
         fig.text(0.5, bottom / height, note, ha="center", fontsize=9)
-        bottom += 0.3
+        bottom += 0.18 + 0.16 * (note.count("\n") + 1)
     if secondary:
         fig.legend(handles=secondary, loc="lower center", frameon=False,
                    bbox_to_anchor=(0.5, bottom / height), ncol=2, fontsize=9)
@@ -137,6 +160,30 @@ def add_figure_legends(fig, selectors, secondary=(), note=None):
 def ordered_present(values, preferred):
     values = [str(v) for v in pd.Series(list(values), dtype=object).dropna().unique()]
     return [v for v in preferred if v in values] + sorted(v for v in values if v not in preferred)
+
+
+def selector_style(name):
+    return SELECTOR_STYLES.get(name, (name, "#666666", "o"))
+
+
+def filter_records(data, filters=None, keep_baseline=False):
+    """Filter rows without recalculating scores; paired AP retains its reference."""
+    if not filters:
+        return data
+    mask = pd.Series(True, index=data.index)
+    for column in ("selector", "model", "imbalance"):
+        allowed = filters.get(column)
+        if column in data and allowed is not None:
+            allowed = set(allowed)
+            if column == "selector" and keep_baseline:
+                allowed.add("none")
+            mask &= data[column].isin(allowed)
+    if "selector" in data:
+        excluded = set(filters.get("exclude_selectors", ()))
+        if keep_baseline:
+            excluded.discard("none")
+        mask &= ~data.selector.isin(excluded)
+    return data.loc[mask].copy()
 
 
 def check_complete_grid(data, imbalances, selectors, models, message):
@@ -163,11 +210,11 @@ def validate_splits(data, config):
 
 
 @plt.rc_context(PLOT_STYLE)
-def plot_tradeoff(base_dir=BASE_DIR, run_id=RUN_ID, out_dir=None):
+def plot_tradeoff(base_dir=BASE_DIR, run_id=RUN_ID, out_dir=None, filters=None):
     base_dir = Path(base_dir)
     run_id = resolve_run_id(base_dir, run_id)
-    summary = read_json_records(base_dir / f"{run_id}_summary.json")
-    stability = read_json_records(base_dir / f"{run_id}_stability.json")
+    summary = read_json_records(base_dir / f"{run_id}_summary.json", filters)
+    stability = read_json_records(base_dir / f"{run_id}_stability.json", filters)
 
     merge_keys = ["imbalance", "selector"]
     if "model" in stability.columns:
@@ -241,8 +288,8 @@ def plot_tradeoff(base_dir=BASE_DIR, run_id=RUN_ID, out_dir=None):
     axes[0, 0].set_ylim(0, ymax * 1.1)
 
     handles = [
-        Line2D([], [], color=SELECTOR_STYLES[s][1], marker=SELECTOR_STYLES[s][2],
-               linestyle="none", markersize=7, label=SELECTOR_STYLES[s][0])
+        Line2D([], [], color=selector_style(s)[1], marker=selector_style(s)[2],
+               linestyle="none", markersize=7, label=selector_style(s)[0])
         for s in selectors
     ]
 
@@ -256,10 +303,10 @@ def plot_tradeoff(base_dir=BASE_DIR, run_id=RUN_ID, out_dir=None):
 
 
 @plt.rc_context(PLOT_STYLE)
-def plot_ap_difference(base_dir=BASE_DIR, run_id=RUN_ID, out_dir=None):
+def plot_ap_difference(base_dir=BASE_DIR, run_id=RUN_ID, out_dir=None, filters=None):
     base_dir = Path(base_dir)
     run_id = resolve_run_id(base_dir, run_id)
-    data = read_json_records(base_dir / f"{run_id}_results.json")
+    data = read_json_records(base_dir / f"{run_id}_results.json", filters, keep_baseline=True)
     config = read_config(base_dir, run_id)
 
     keys = ["repeat", "fold", "imbalance", "model"]
@@ -323,7 +370,7 @@ def plot_ap_difference(base_dir=BASE_DIR, run_id=RUN_ID, out_dir=None):
             ax.axhline(0, color="#444444", linestyle="--", linewidth=1)
 
             for x, selector in enumerate(selectors):
-                _, color, _ = SELECTOR_STYLES[selector]
+                _, color, _ = selector_style(selector)
                 values = repeat_means.loc[
                     repeat_means["imbalance"].eq(imbalance)
                     & repeat_means["model"].eq(model)
@@ -349,8 +396,8 @@ def plot_ap_difference(base_dir=BASE_DIR, run_id=RUN_ID, out_dir=None):
     axes[0, 0].set_ylim(-limit, limit)
 
     selector_handles = [
-        Line2D([], [], color=SELECTOR_STYLES[s][1], marker="o",
-               linestyle="none", markersize=7, label=SELECTOR_STYLES[s][0])
+        Line2D([], [], color=selector_style(s)[1], marker="o",
+               linestyle="none", markersize=7, label=selector_style(s)[0])
         for s in selectors
     ]
     shape_handles = [
@@ -370,126 +417,325 @@ def plot_ap_difference(base_dir=BASE_DIR, run_id=RUN_ID, out_dir=None):
     return fig, axes, repeat_means, paired
 
 
+def load_imbalance_comparison(base_dir, run_id, table, filters=None):
+    """Keep the no-handling reference even when only SMOTE or weighting is shown."""
+    reference_filters = dict(filters or {})
+    if reference_filters.get("imbalance") is not None:
+        reference_filters["imbalance"] = list(set(reference_filters["imbalance"]) | {"none"})
+    data = read_json_records(Path(base_dir) / f"{run_id}_{table}.json", reference_filters)
+    displayed = filter_records(data, filters)
+    conditions = [i for i in ordered_present(displayed.imbalance, IMBALANCE_ORDER) if i != "none"]
+    if not conditions or not data.imbalance.eq("none").any():
+        raise PlotUnavailable("Imbalance comparison needs no-handling baseline and a displayed treatment")
+    return data, conditions
+
+
 @plt.rc_context(PLOT_STYLE)
-def plot_recall_precision(base_dir=BASE_DIR, run_id=RUN_ID, out_dir=None):
-    base_dir = Path(base_dir)
+def plot_imbalance_ap(base_dir=BASE_DIR, run_id=RUN_ID, out_dir=None, filters=None):
+    """Compare the same selector, learner and validation split across conditions."""
     run_id = resolve_run_id(base_dir, run_id)
-    data = read_json_records(base_dir / f"{run_id}_results.json")
+    data, conditions = load_imbalance_comparison(base_dir, run_id, "results", filters)
     config = read_config(base_dir, run_id)
-
-    selectors = ordered_present(data["selector"], SELECTOR_STYLES)
-    imbalances = ordered_present(data["imbalance"], IMBALANCE_LABELS)
-    models = ordered_present(data["model"], MODEL_LABELS)
-    keys = ["repeat", "fold", "imbalance", "selector", "model"]
-
     validate_splits(data, config)
-    if data[["recall", "precision", "tp", "fp", "fn"]].isna().any().any():
-        raise PlotUnavailable("Recall and precision need recorded scores and confusion counts for every split")
-
-    for metric in ["recall", "precision"]:
-        if not np.isfinite(data[metric]).all() or not data[metric].between(0, 1).all():
-            raise ValueError(f"Invalid {metric}")
-
-    check_complete_grid(data, imbalances, selectors, models, "Missing or unexpected configurations")
-
-    for metric, denominator in [("recall", data.tp + data.fn), ("precision", data.tp + data.fp)]:
-        calculated = np.divide(
-            data.tp.to_numpy(dtype=float),
-            denominator.to_numpy(dtype=float),
-            out=np.zeros(len(data)),
-            where=denominator.to_numpy() != 0,
-        )
-        np.testing.assert_allclose(data[metric], calculated, atol=1e-12)
-
-    data["no_predicted_failures"] = (data.tp + data.fp).eq(0)
-    repeat_means = data.groupby(
-        ["repeat", "imbalance", "selector", "model"],
-        as_index=False,
-    ).agg(
-        recall=("recall", "mean"),
-        precision=("precision", "mean"),
-        n_folds=("fold", "nunique"),
-        folds_without_predicted_failures=("no_predicted_failures", "sum"),
+    data["ap"] = pd.to_numeric(data.ap, errors="raise")
+    recorded = data.ap.dropna()
+    if not np.isfinite(recorded).all() or not recorded.between(0, 1).all():
+        raise ValueError("AP must be between zero and one or missing")
+    keys = ["repeat", "fold", "selector", "model"]
+    baseline = data.loc[data.imbalance.eq("none"), keys + ["ap"]].rename(columns={"ap": "baseline_ap"})
+    paired = data.loc[data.imbalance.isin(conditions)].merge(
+        baseline, on=keys, how="left", validate="many_to_one", indicator=True,
     )
-
-    assert repeat_means["n_folds"].eq(config["n_splits"]).all()
-
+    if not paired._merge.eq("both").all():
+        raise ValueError("Imbalance AP comparison has unmatched baseline splits")
+    paired = paired.drop(columns="_merge").sort_values(["imbalance", "model", "selector", "repeat", "fold"])
+    paired["delta_ap"] = paired.ap - paired.baseline_ap
+    group_keys = ["imbalance", "model", "selector"]
+    repeats = paired.groupby(group_keys + ["repeat"], as_index=False).agg(
+        ap=("ap", "mean"), baseline_ap=("baseline_ap", "mean"),
+        delta_ap=("delta_ap", "mean"), n_paired_folds=("delta_ap", "count"),
+    )
+    # Missing scores must not silently turn a full-repeat estimate into a partial mean.
+    complete = repeats.n_paired_folds.eq(config["n_splits"])
+    repeats.loc[~complete, ["ap", "baseline_ap", "delta_ap"]] = np.nan
+    summary = repeats.groupby(group_keys, as_index=False).agg(
+        ap_mean=("ap", "mean"), baseline_ap_mean=("baseline_ap", "mean"),
+        delta_ap_mean=("delta_ap", "mean"), delta_ap_sd=("delta_ap", "std"),
+        n_complete_repeats=("delta_ap", "count"), n_expected_repeats=("repeat", "size"),
+    )
+    selectors = ordered_present(repeats.selector, SELECTOR_ORDER)
+    models = ordered_present(repeats.model, MODEL_ORDER)
+    fig, axes = plt.subplots(
+        len(conditions), len(models), squeeze=False, sharex=True, sharey=True,
+        figsize=(max(9, 4.3 * len(models)), max(5.5, (0.46 * len(selectors) + 1.4) * len(conditions) + 1)),
+    )
+    for row, condition in enumerate(conditions):
+        for col, model in enumerate(models):
+            ax = axes[row, col]
+            ax.axvline(0, color="#777777", linewidth=1)
+            for y, selector in enumerate(selectors):
+                values = repeats.loc[
+                    repeats.imbalance.eq(condition) & repeats.model.eq(model)
+                    & repeats.selector.eq(selector), "delta_ap"
+                ].dropna().to_numpy()
+                color = selector_style(selector)[1]
+                if len(values):
+                    ax.scatter(values, y + np.linspace(-0.14, 0.14, len(values)),
+                               s=18, alpha=0.4, color=color)
+                    ax.scatter(values.mean(), y, marker="D", s=58, color=color,
+                               edgecolor="black", linewidth=0.7, zorder=3)
+                else:
+                    ax.text(0.97, y, "Unavailable", transform=ax.get_yaxis_transform(),
+                            ha="right", va="center", fontsize=8)
+            ax.set_yticks(range(len(selectors)), [textwrap.fill(selector_style(s)[0], 19) for s in selectors])
+            ax.set_ylim(len(selectors) - 0.5, -0.5)
+            ax.set_title(f"{IMBALANCE_LABELS.get(condition, condition)}\n{MODEL_LABELS.get(model, model)}")
+            ax.set_xlabel("Change in average precision")
+            ax.grid(axis="x", alpha=0.2)
+            ax.spines[["top", "right"]].set_visible(False)
+    limit = max(float(repeats.delta_ap.abs().max()), 0.01) if repeats.delta_ap.notna().any() else 0.01
+    axes[0, 0].set_xlim(-limit * 1.15, limit * 1.15)
+    fig.suptitle("Effect of imbalance handling on quality anomaly prediction", fontsize=14)
+    handles = [Line2D([], [], marker=m, linestyle="none", color="#555555", label=label)
+               for m, label in [("o", "Mean paired change within a repeat"), ("D", "Mean across complete repeats")]]
+    fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.5, 0.015), ncol=2, frameon=False)
+    fig.tight_layout(rect=(0, 0.08, 1, 0.92))
     out = output_directory(base_dir, run_id, out_dir)
-    repeat_means.to_csv(out / f"{run_id}_rq1_recall_precision_repeat_means.csv", index=False)
-
-    figures = {}
-    for metric in ["recall", "precision"]:
-        fig, axes = plt.subplots(
-            len(imbalances),
-            len(models),
-            figsize=(max(10, 4.2 * len(models)), max(6, 3.2 * len(imbalances))),
-            sharex=True,
-            sharey=True,
-            squeeze=False,
-        )
-
-        for i, imbalance in enumerate(imbalances):
-            for j, model in enumerate(models):
-                ax = axes[i, j]
-
-                for x, selector in enumerate(selectors):
-                    _, color, _ = SELECTOR_STYLES[selector]
-                    values = repeat_means.loc[
-                        repeat_means["imbalance"].eq(imbalance)
-                        & repeat_means["model"].eq(model)
-                        & repeat_means["selector"].eq(selector)
-                    ].sort_values("repeat")[metric].to_numpy()
-
-                    ax.scatter(x + np.linspace(-0.15, 0.15, len(values)), values,
-                               s=24, color=color, alpha=0.65, zorder=3)
-                    ax.scatter(x, values.mean(), marker="D", s=65, color=color,
-                               edgecolor="black", linewidth=0.8, zorder=4)
-
-                ax.set_xticks([])
-                ax.set_xlim(-0.5, len(selectors) - 0.5)
-                ax.set_ylim(-0.025, 1.025)
-                ax.set_yticks(np.linspace(0, 1, 6))
-                ax.grid(axis="y", alpha=0.2)
-                ax.spines[["top", "right"]].set_visible(False)
-
-                if i == 0:
-                    ax.set_title(MODEL_LABELS.get(model, model))
-                if j == 0:
-                    ax.set_ylabel(f"{IMBALANCE_LABELS.get(imbalance, imbalance)}\n{metric.capitalize()}")
-
-        color_handles = [
-            Line2D([], [], marker="o", color=SELECTOR_STYLES[s][1],
-                   linestyle="none", label=SELECTOR_STYLES[s][0])
-            for s in selectors
-        ]
-        shape_handles = [
-            Line2D([], [], marker="o", color="#555555", linestyle="none",
-                   label="Mean of fold scores within a repeat"),
-            Line2D([], [], marker="D", color="#555555", markeredgecolor="black",
-                   linestyle="none", label="Mean across repeats"),
-        ]
-
-        fig.suptitle(
-            f'Quality anomaly {metric} after feature selection\nDecision threshold {config["decision_threshold"]:g}',
-            fontsize=14,
-        )
-        note = "Precision is recorded as zero when a fold has no predicted failures" if metric == "precision" else None
-        add_figure_legends(fig, color_handles, shape_handles, note)
-        save_figure(fig, out, f"{run_id}_rq1_{metric}")
-
-        figures[metric] = (fig, axes)
-
-    return figures, repeat_means
+    stem = f"{run_id}_rq4_imbalance_ap"
+    save_figure(fig, out, stem)
+    paired.to_csv(out / f"{stem}_paired_folds.csv", index=False)
+    repeats.to_csv(out / f"{stem}_repeat_means.csv", index=False)
+    summary.to_csv(out / f"{stem}_summary.csv", index=False)
+    return fig, axes, repeats, paired
 
 
 @plt.rc_context(PLOT_STYLE)
-def plot_rq2a_nogueira_stability(base_dir=BASE_DIR, run_id=RUN_ID, out_dir=None):
+def plot_imbalance_stability(base_dir=BASE_DIR, run_id=RUN_ID, out_dir=None, filters=None):
+    """Show saved stability and subset sizes, without inventing sampling intervals."""
+    run_id = resolve_run_id(base_dir, run_id)
+    data, conditions = load_imbalance_comparison(base_dir, run_id, "stability", filters)
+    data = data.loc[data.selector.ne("none")].copy()
+    if data.empty:
+        raise PlotUnavailable("Imbalance stability comparison needs a feature selector")
+    keys = ["imbalance", "selector"] + (["model"] if "model" in data else [])
+    if "n_features_mean" not in data:
+        reference_filters = {**(filters or {}), "imbalance": None}
+        counts = read_json_records(Path(base_dir) / f"{run_id}_summary.json", reference_filters)
+        counts = counts[keys + ["n_features_mean"]].drop_duplicates()
+        if counts.duplicated(keys).any():
+            raise ValueError("Model-independent stability has inconsistent feature counts across models")
+        data = data.merge(counts, on=keys, how="left", validate="one_to_one")
+    metrics = ["nogueira", "n_features_mean"]
+    data = validate_frame(data, keys, metrics, "stability.json")
+    if np.isinf(data[metrics].to_numpy()).any() or data.n_features_mean.dropna().lt(0).any():
+        raise ValueError("Stability comparison needs finite or missing scores and nonnegative feature counts")
+    pair_keys = [key for key in keys if key != "imbalance"]
+    baseline = data.loc[data.imbalance.eq("none"), pair_keys + metrics].rename(
+        columns={metric: f"baseline_{metric}" for metric in metrics})
+    paired = data.loc[data.imbalance.isin(conditions)].merge(
+        baseline, on=pair_keys, how="left", validate="many_to_one",
+    ).sort_values(keys)
+    if paired.empty:
+        raise PlotUnavailable("No selected stability comparisons are available")
+    for metric in metrics:
+        paired[f"delta_{metric}"] = paired[metric] - paired[f"baseline_{metric}"]
+    if "model" not in paired:
+        paired["model"] = "all_models"
+    selectors = ordered_present(paired.selector, SELECTOR_ORDER)
+    models = ordered_present(paired.model, MODEL_ORDER)
+    panels = [(condition, model) for condition in conditions for model in models]
+    fig, axes = plt.subplots(
+        len(panels), 2, squeeze=False, sharey=True, sharex="col",
+        figsize=(12, max(5.5, (0.5 * len(selectors) + 1.3) * len(panels) + 1)),
+    )
+    for row, (condition, model) in enumerate(panels):
+        subset = paired.loc[paired.imbalance.eq(condition) & paired.model.eq(model)].set_index("selector")
+        for col, (metric, label) in enumerate(zip(metrics, ["Nogueira stability", "Mean selected feature count"])):
+            ax = axes[row, col]
+            for y, selector in enumerate(selectors):
+                if selector not in subset.index:
+                    ax.text(0.97, y, "Unavailable", transform=ax.get_yaxis_transform(), ha="right", va="center", fontsize=8)
+                    continue
+                before = subset.loc[selector, f"baseline_{metric}"]
+                after = subset.loc[selector, metric]
+                color = selector_style(selector)[1]
+                if np.isfinite(before) and np.isfinite(after):
+                    ax.plot([before, after], [y, y], color=color, alpha=0.6, linewidth=2)
+                if np.isfinite(before):
+                    ax.scatter(before, y, marker="o", s=70, facecolor="white", edgecolor=color, linewidth=1.5, zorder=3)
+                if np.isfinite(after):
+                    ax.scatter(after, y, marker="D", s=35, color=color, zorder=4)
+                if not (np.isfinite(before) and np.isfinite(after)):
+                    ax.text(0.97, y, "Incomplete", transform=ax.get_yaxis_transform(), ha="right", va="center", fontsize=8)
+            title = IMBALANCE_LABELS.get(condition, condition)
+            if model != "all_models":
+                title += f"\n{MODEL_LABELS.get(model, model)}"
+            ax.set_title(title)
+            ax.set_xlabel(label)
+            ax.set_yticks(range(len(selectors)), [textwrap.fill(selector_style(s)[0], 19) for s in selectors])
+            ax.set_ylim(len(selectors) - 0.5, -0.5)
+            ax.grid(axis="x", alpha=0.2)
+            ax.spines[["top", "right"]].set_visible(False)
+    finite = paired[["nogueira", "baseline_nogueira"]].to_numpy()
+    finite = finite[np.isfinite(finite)]
+    axes[0, 0].set_xlim(min(0, finite.min()) - 0.04 if finite.size else -0.04,
+                        max(1, finite.max()) + 0.04 if finite.size else 1.04)
+    axes[0, 1].set_xlim(left=-0.5)
+    fig.suptitle("Effect of imbalance handling on selection stability and feature count", fontsize=14)
+    handles = [
+        Line2D([], [], marker="o", markerfacecolor="white", color="#555555", linestyle="none",
+               label="No resampling and no class weighting"),
+        Line2D([], [], marker="D", color="#555555", linestyle="none", label="Condition shown in the panel"),
+    ]
+    fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.5, 0.015), ncol=2, frameon=False)
+    fig.tight_layout(rect=(0, 0.08, 1, 0.92))
+    out = output_directory(base_dir, run_id, out_dir)
+    stem = f"{run_id}_rq4_imbalance_stability"
+    save_figure(fig, out, stem)
+    paired.to_csv(out / f"{stem}.csv", index=False)
+    return fig, axes, paired
+
+
+def load_threshold_results(base_dir, run_id, filters=None):
+    """Normalize new threshold tables and legacy single-threshold results."""
+    config = read_config(base_dir, run_id)
+    path = Path(base_dir) / f"{run_id}_thresholds.json"
+    if path.exists():
+        data = read_json_records(path, filters).copy()
+    else:
+        data = read_json_records(Path(base_dir) / f"{run_id}_results.json", filters).copy()
+        if "recall" not in data or "decision_threshold" not in config:
+            raise PlotUnavailable("No saved threshold scores; generate the thresholds JSON with 04_exp_1.py")
+        data["threshold"] = config["decision_threshold"]
+    metrics = ["recall", "precision", "tp", "fp", "fn", "tn"]
+    required = {"repeat", "fold", "imbalance", "selector", "model", "threshold", *metrics}
+    if required - set(data):
+        raise ValueError(f"Threshold table is missing columns: {sorted(required - set(data))}")
+    if data.empty:
+        raise PlotUnavailable("The threshold table is empty")
+    for column in ["threshold", *metrics]:
+        data[column] = pd.to_numeric(data[column], errors="raise")
+    if not np.isfinite(data.threshold).all() or not data.threshold.between(0, 1).all():
+        raise ValueError("Thresholds must be finite values between zero and one")
+    available = sorted(data.threshold.unique())
+    if "threshold_grid" in config:
+        expected = sorted(config["threshold_grid"])
+        if len(expected) != len(available) or not np.allclose(expected, available, rtol=0, atol=1e-12):
+            raise ValueError("Saved thresholds do not match the configured threshold grid")
+    reference = None
+    keys = ["repeat", "fold", "imbalance", "selector", "model"]
+    for _, group in data.groupby("threshold"):
+        validate_splits(group, config)
+        identifiers = set(group[keys].itertuples(index=False, name=None))
+        if reference is not None and identifiers != reference:
+            raise ValueError("Thresholds must contain identical configurations and splits")
+        reference = identifiers
+    missing = data[metrics].isna()
+    if (missing.any(axis=1) & ~missing.all(axis=1)).any():
+        raise ValueError("Threshold rows must have all scores present or all scores missing")
+    valid = ~missing.any(axis=1)
+    recorded = data.loc[valid]
+    if not np.isfinite(recorded[metrics]).all().all():
+        raise ValueError("Threshold scores must be finite")
+    for metric in ["recall", "precision"]:
+        if not recorded[metric].between(0, 1).all():
+            raise ValueError(f"Invalid {metric}")
+    counts = recorded[["tp", "fp", "fn", "tn"]]
+    if (counts < 0).any().any() or (counts % 1 != 0).any().any():
+        raise ValueError("Confusion counts must be nonnegative integers")
+    for metric, denominator in [("recall", recorded.tp + recorded.fn),
+                                ("precision", recorded.tp + recorded.fp)]:
+        calculated = np.divide(recorded.tp.to_numpy(dtype=float), denominator.to_numpy(dtype=float),
+                               out=np.zeros(len(recorded)), where=denominator.to_numpy() != 0)
+        if not np.allclose(recorded[metric], calculated, rtol=0, atol=1e-10):
+            raise ValueError(f"Recorded {metric} does not match confusion counts")
+    data["valid_score"] = valid
+    data["no_predicted_failures"] = valid & (data.tp + data.fp).eq(0)
+    return data, config
+
+
+def threshold_repeat_means(data):
+    """Exclude incomplete repeats, preserving their coverage in the export."""
+    means = data.groupby(["threshold", "repeat", "imbalance", "selector", "model"],
+                         as_index=False).agg(
+        recall=("recall", "mean"), precision=("precision", "mean"),
+        n_folds=("fold", "nunique"), n_valid_folds=("valid_score", "sum"),
+        folds_without_predicted_failures=("no_predicted_failures", "sum"))
+    means["complete_repeat"] = means.n_valid_folds.eq(means.n_folds)
+    means.loc[~means.complete_repeat, ["recall", "precision"]] = np.nan
+    return means
+
+
+def summarize_threshold_scores(data, config):
+    """Use identical complete evaluation coverage for threshold comparisons."""
+    repeats = threshold_repeat_means(data)
+    summary = repeats.groupby(["imbalance", "selector", "model", "threshold"], as_index=False).agg(
+        recall_mean=("recall", "mean"), precision_mean=("precision", "mean"),
+        n_complete_repeats=("complete_repeat", "sum"),
+        n_valid_folds=("n_valid_folds", "sum"), n_expected_folds=("n_folds", "sum"),
+        folds_without_predicted_failures=("folds_without_predicted_failures", "sum"))
+    # Do not compare a threshold's easy/successful repeats against a different set.
+    incomplete = summary.n_complete_repeats.ne(config["n_repeats"])
+    summary.loc[incomplete, ["recall_mean", "precision_mean"]] = np.nan
+    return repeats, summary
+
+
+
+
+@plt.rc_context(PLOT_STYLE)
+def plot_threshold_sweep(data, config, out_dir, run_id, show=False):
+    """Compare both metrics at saved operating points, not an interpolated PR curve."""
+    repeats, summary = summarize_threshold_scores(data, config)
+    repeats.to_csv(Path(out_dir) / f"{run_id}_threshold_repeat_means.csv", index=False)
+    summary.to_csv(Path(out_dir) / f"{run_id}_threshold_comparison.csv", index=False)
+    for (imbalance, model), group in summary.groupby(["imbalance", "model"], sort=True):
+        selectors = ordered_present(group.selector, SELECTOR_STYLES)
+        columns = min(3, len(selectors))
+        rows = int(np.ceil(len(selectors) / columns))
+        fig, axes = plt.subplots(rows, columns, figsize=(5 * columns, 3.5 * rows + 1.4),
+                                 sharex=True, sharey=True, squeeze=False)
+        for ax, selector in zip(axes.flat, selectors):
+            values = group.loc[group.selector.eq(selector)].sort_values("threshold")
+            for metric, label, color, marker in [("recall", "Recall", "#0072B2", "o"),
+                                                  ("precision", "Precision", "#D55E00", "s")]:
+                ax.plot(values.threshold, values[f"{metric}_mean"], color=color,
+                        marker=marker, markersize=4, linewidth=1.5, label=label)
+            if values.recall_mean.isna().any():
+                ax.text(0.5, 0.5, "Incomplete evaluation\nSee coverage in the CSV table",
+                        transform=ax.transAxes, ha="center", fontsize=9)
+            ax.set_title(SELECTOR_LABELS.get(selector, selector))
+            ax.set_xlabel("Decision threshold")
+            ax.set_ylabel("Mean score across repeats")
+            ax.set_xlim(0, 1)
+            ax.set_ylim(-0.025, 1.025)
+            ax.set_yticks(np.linspace(0, 1, 6))
+            ax.tick_params(labelbottom=True, labelleft=True)
+            ax.grid(alpha=0.2)
+            ax.spines[["top", "right"]].set_visible(False)
+        for ax in list(axes.flat)[len(selectors):]:
+            ax.set_visible(False)
+        fig.suptitle("Recall and precision at different decision thresholds\n"
+                     f"{IMBALANCE_LABELS.get(imbalance, imbalance)} | {MODEL_LABELS.get(model, model)}",
+                     fontsize=14)
+        handles, labels = axes.flat[0].get_legend_handles_labels()
+        fig.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, 0.045),
+                   ncol=2, frameon=False)
+        fig.text(0.5, 0.02, "All repeats required for each point. Precision is zero when no failures are predicted.",
+                 ha="center", fontsize=9)
+        fig.tight_layout(rect=(0, 0.85 / fig.get_size_inches()[1], 1, 1))
+        save_figure(fig, out_dir, f"{run_id}_threshold_comparison_{imbalance}_{model}")
+        finish_figure(fig, show)
+    return summary
+
+
+@plt.rc_context(PLOT_STYLE)
+def plot_rq2a_nogueira_stability(base_dir=BASE_DIR, run_id=RUN_ID, out_dir=None, filters=None):
     """Plot saved stability metrics. Supports MI, FDR, L1, XGB, Boruta, and Voting."""
     base_dir = Path(base_dir)
     run_id = resolve_run_id(base_dir, run_id)
     out_dir = output_directory(base_dir, run_id, out_dir)
 
-    df = read_json_records(base_dir / f'{run_id}_stability.json')
+    df = read_json_records(base_dir / f'{run_id}_stability.json', filters)
 
     required = {'imbalance', 'selector', *STABILITY_METRICS}
     missing = required - set(df.columns)
@@ -604,7 +850,8 @@ def plot_rq2a_nogueira_stability(base_dir=BASE_DIR, run_id=RUN_ID, out_dir=None)
 
 
 @plt.rc_context(PLOT_STYLE)
-def plot_rq2b_top_feature_frequency(base_dir=BASE_DIR, run_id=RUN_ID, top_n=10, out_dir=None):
+def plot_rq2b_top_feature_frequency(base_dir=BASE_DIR, run_id=RUN_ID, top_n=10, out_dir=None,
+                                    filters=None):
     """Plot top selected features per imbalance/selector configuration. Supports FDR."""
     if isinstance(top_n, bool) or not isinstance(top_n, int) or top_n < 1:
         raise ValueError('top_n must be a positive integer')
@@ -613,7 +860,7 @@ def plot_rq2b_top_feature_frequency(base_dir=BASE_DIR, run_id=RUN_ID, top_n=10, 
     run_id = resolve_run_id(base_dir, run_id)
     out_dir = output_directory(base_dir, run_id, out_dir)
 
-    df = read_json_records(base_dir / f'{run_id}_feature_frequency.json')
+    df = read_json_records(base_dir / f'{run_id}_feature_frequency.json', filters)
 
     keys = ['imbalance', 'selector', 'feature']
     required = keys + ['selection_frequency', 'selected_count', 'n_runs']
@@ -740,7 +987,7 @@ def plot_rq2b_top_feature_frequency(base_dir=BASE_DIR, run_id=RUN_ID, top_n=10, 
 
     return fig, axes, top
 
-def read_json_records(path):
+def read_json_records(path, filters=None, keep_baseline=False):
     with Path(path).open(encoding="utf-8") as file:
         records = json.load(file)
 
@@ -749,7 +996,10 @@ def read_json_records(path):
             f"{Path(path).name}: expected a nonempty list of records"
         )
 
-    return pd.DataFrame(records)
+    data = filter_records(pd.DataFrame(records), filters, keep_baseline)
+    if data.empty:
+        raise PlotUnavailable(f"{Path(path).name}: no records match the display selection")
+    return data
 
 
 def validate_frame(df, keys, metrics, filename):
@@ -782,7 +1032,7 @@ def validate_frame(df, keys, metrics, filename):
 
 
 @plt.rc_context(PLOT_STYLE)
-def plot_rq3_main_tradeoff(base_dir=BASE_DIR, run_id=RUN_ID, out_dir=None):
+def plot_rq3_main_tradeoff(base_dir=BASE_DIR, run_id=RUN_ID, out_dir=None, filters=None):
     """
     Plot aligned heatmaps using saved JSON metrics.
 
@@ -812,10 +1062,10 @@ def plot_rq3_main_tradeoff(base_dir=BASE_DIR, run_id=RUN_ID, out_dir=None):
     # Read and validate saved results
     # ---------------------------------------------------------
     summary = read_json_records(
-        base_dir / f"{run_id}_summary.json"
+        base_dir / f"{run_id}_summary.json", filters
     )
     stability = read_json_records(
-        base_dir / f"{run_id}_stability.json"
+        base_dir / f"{run_id}_stability.json", filters
     )
 
     stability_keys = (
@@ -1263,11 +1513,11 @@ def _q3(s):
     return s.quantile(0.75)
 
 
-def load_timing(base_dir, run_id):
+def load_timing(base_dir, run_id, filters=None):
     """One row per fold x imbalance x selector x model, with selection, fit and predict time."""
     base_dir = Path(base_dir)
-    results = read_json_records(base_dir / f"{run_id}_results.json")
-    selections = read_json_records(base_dir / f"{run_id}_selections.json")
+    results = read_json_records(base_dir / f"{run_id}_results.json", filters)
+    selections = read_json_records(base_dir / f"{run_id}_selections.json", filters)
 
     sel_keys = ["fold", "repeat", "imbalance", "selector"]
     selections = selections[sel_keys + ["n_features_after_preprocessing", "selection_time(s)"]]
@@ -1447,9 +1697,9 @@ def plot_slowest_configs(df, out_dir, run_id, top_n=15):
     return fig, (ax1, ax2)
 
 
-def run_timing_analysis(base_dir, run_id, out_dir, top_n=15, show=False):
+def run_timing_analysis(base_dir, run_id, out_dir, top_n=15, show=False, filters=None):
     """Run every timing table and figure; everything is written to out_dir."""
-    df = load_timing(base_dir, run_id)
+    df = load_timing(base_dir, run_id, filters)
     if df.empty:
         print("Skipped timing analysis: no complete timing records")
         return df, pd.DataFrame(), pd.DataFrame()
@@ -1470,18 +1720,88 @@ def finish_figure(fig, show=False):
     plt.close(fig)
 
 
+def remove_obsolete_threshold_outputs(out_dir, run_id):
+    """Remove retired threshold figures and their score tables."""
+    patterns = [f"{run_id}_rq1_recall_precision_threshold_*_repeat_means.csv",
+                f"{run_id}_rq1_recall_precision_repeat_means.csv",
+                f"{run_id}_rq1_precision_recall_curve.png",
+                f"{run_id}_rq1_precision_recall_curve.pdf",
+                f"{run_id}_rq1_precision_recall_curve.csv",
+                f"{run_id}_rq1_precision_recall_curve_repeat_means.csv"]
+    for metric in ("recall", "precision"):
+        for extension in ("png", "pdf"):
+            patterns.extend([f"{run_id}_rq1_{metric}_threshold_*.{extension}",
+                             f"{run_id}_rq1_{metric}.{extension}"])
+    for pattern in patterns:
+        for path in Path(out_dir).glob(pattern):
+            if path.is_file():
+                path.unlink(missing_ok=True)
+
+
+def display_options(base_dir, run_id):
+    data = read_json_records(Path(base_dir) / f"{run_id}_results.json")
+    return {
+        "selector": ordered_present(data.selector, SELECTOR_STYLES),
+        "model": ordered_present(data.model, MODEL_LABELS),
+        "imbalance": ordered_present(data.imbalance, IMBALANCE_LABELS),
+    }
+
+
+def normalize_choices(values, label):
+    if values is None:
+        return None
+    if isinstance(values, str):
+        raise ValueError(f"{label} must be a list of names")
+    return sorted(set(values))
+
+
 def run_all(base_dir=BASE_DIR, run_id=None, out_dir=None, top_n=10,
-            timing_top_n=15, show=False):
+            timing_top_n=15, show=False, plots=None, selectors=None,
+            exclude_selectors=None, models=None, imbalances=None):
     """Render one run using the same labels, style and destination throughout."""
     base_dir = Path(base_dir)
     run_id = resolve_run_id(base_dir, run_id)
+    selected_plots = normalize_choices(plots, "plots")
+    selected_plots = list(PLOT_LABELS) if selected_plots is None else selected_plots
+    if not selected_plots or set(selected_plots) - PLOT_LABELS.keys():
+        raise ValueError(f"Choose plots from: {', '.join(PLOT_LABELS)}")
+    filters = {
+        "selector": normalize_choices(selectors, "selectors"),
+        "model": normalize_choices(models, "models"),
+        "imbalance": normalize_choices(imbalances, "imbalances"),
+        "exclude_selectors": normalize_choices(exclude_selectors, "exclude_selectors") or [],
+    }
+    available_options = display_options(base_dir, run_id)
+    for column, available in available_options.items():
+        requested = filters[column]
+        if requested is not None and (not requested or set(requested) - set(available)):
+            raise ValueError(f"Unavailable {column} selection {requested}. Available: {', '.join(available)}")
+    results = read_json_records(base_dir / f"{run_id}_results.json", filters)
     out_dir = output_directory(base_dir, run_id, out_dir)
+    view = {"plots": sorted(selected_plots), **filters,
+            "top_n": top_n, "timing_top_n": timing_top_n}
+    if plots is not None or any(filters.values()):
+        fingerprint = hashlib.sha256(json.dumps(view, sort_keys=True).encode()).hexdigest()[:12]
+        out_dir = output_directory(base_dir, run_id, out_dir / "views" / fingerprint)
+    with (out_dir / "view_config.json").open("w", encoding="utf-8") as file:
+        json.dump({"run_id": run_id, **view}, file, indent=2, sort_keys=True)
+    remove_obsolete_threshold_outputs(out_dir, run_id)
     print(f"Experiment: {run_id}\nOutput: {out_dir}")
-    plots = (plot_tradeoff, plot_ap_difference, plot_recall_precision,
-             plot_rq2a_nogueira_stability, plot_rq2b_top_feature_frequency,
-             plot_rq3_main_tradeoff)
-    for plot in plots:
-        options = {"top_n": top_n} if plot is plot_rq2b_top_feature_frequency else {}
+    plot_functions = {
+        "tradeoff": plot_tradeoff,
+        "ap_difference": plot_ap_difference,
+        "stability": plot_rq2a_nogueira_stability,
+        "feature_frequency": plot_rq2b_top_feature_frequency,
+        "heatmap": plot_rq3_main_tradeoff,
+        "imbalance_ap": plot_imbalance_ap,
+        "imbalance_stability": plot_imbalance_stability,
+    }
+    for name, plot in plot_functions.items():
+        if name not in selected_plots:
+            continue
+        options = {"filters": filters}
+        if name == "feature_frequency":
+            options["top_n"] = top_n
         try:
             result = plot(base_dir, run_id, out_dir=out_dir, **options)
         except PlotUnavailable as exc:
@@ -1494,17 +1814,28 @@ def run_all(base_dir=BASE_DIR, run_id=None, out_dir=None, top_n=10,
         else:
             finish_figure(figures, show)
 
-    results = read_json_records(base_dir / f"{run_id}_results.json")
-    selection_path = base_dir / f"{run_id}_selections.json"
-    selections = read_json_records(selection_path) if selection_path.exists() else pd.DataFrame()
-    has_timing = (
-        {"fit_time(s)", "predict_time_per_observation(ms)"}.issubset(results.columns)
-        and {"selection_time(s)", "n_features_after_preprocessing"}.issubset(selections.columns)
-    )
-    if has_timing:
-        run_timing_analysis(base_dir, run_id, out_dir / "timing", timing_top_n, show)
-    else:
-        print("Skipped timing analysis: this experiment has no complete timing fields")
+    if "thresholds" in selected_plots:
+        try:
+            data, config = load_threshold_results(base_dir, run_id, filters)
+            if "threshold_grid" in config or data.threshold.nunique() > 1:
+                plot_threshold_sweep(data, config, out_dir, run_id, show)
+        except PlotUnavailable as exc:
+            print(f"Skipped threshold analysis: {exc}")
+
+    if "timing" in selected_plots:
+        try:
+            selection_path = base_dir / f"{run_id}_selections.json"
+            selections = read_json_records(selection_path, filters) if selection_path.exists() else pd.DataFrame()
+            has_timing = (
+                {"fit_time(s)", "predict_time_per_observation(ms)"}.issubset(results.columns)
+                and {"selection_time(s)", "n_features_after_preprocessing"}.issubset(selections.columns)
+            )
+            if has_timing:
+                run_timing_analysis(base_dir, run_id, out_dir / "timing", timing_top_n, show, filters)
+            else:
+                print("Skipped timing analysis: this experiment has no complete timing fields")
+        except PlotUnavailable as exc:
+            print(f"Skipped timing analysis: {exc}")
     return out_dir
 
 
@@ -1522,12 +1853,34 @@ def main(argv=None):
     parser.add_argument("--out-dir", type=Path, help="Defaults to experiments/graph/RUN_ID")
     parser.add_argument("--top-n", type=positive_int, default=10)
     parser.add_argument("--timing-top-n", type=positive_int, default=15)
+    parser.add_argument("--plots", nargs="+", choices=list(PLOT_LABELS), default=PLOTS_TO_SHOW,
+                        help="Only create these plot groups; defaults to all")
+    parser.add_argument("--selectors", nargs="+", default=SELECTORS_TO_SHOW,
+                        help="Only display these selectors, e.g. mi l1 xgb boruta")
+    parser.add_argument("--exclude-selectors", nargs="*", default=SELECTORS_TO_HIDE,
+                        help="Hide these selectors, e.g. vote; no names clears the default exclusions")
+    parser.add_argument("--models", nargs="+", default=MODELS_TO_SHOW,
+                        help="Only display these models, e.g. lr rf")
+    parser.add_argument("--imbalances", nargs="+", default=IMBALANCES_TO_SHOW,
+                        help="Only display these conditions, e.g. none weight smote")
+    parser.add_argument("--list-options", action="store_true",
+                        help="List plot groups and available experiment categories without creating figures")
     parser.add_argument("--show", action="store_true", help="Also display figures interactively")
     args = parser.parse_args(argv)
     if not args.show:
         plt.switch_backend("Agg")
     try:
-        run_all(args.base_dir, args.run_id, args.out_dir, args.top_n, args.timing_top_n, args.show)
+        if args.list_options:
+            run_id = resolve_run_id(args.base_dir, args.run_id)
+            print(f"Experiment: {run_id}")
+            for name, label in PLOT_LABELS.items():
+                print(f"  {name}: {label}")
+            for column, values in display_options(args.base_dir, run_id).items():
+                print(f"{column}: {', '.join(values)}")
+            return
+        run_all(args.base_dir, args.run_id, args.out_dir, args.top_n, args.timing_top_n, args.show,
+                plots=args.plots, selectors=args.selectors, exclude_selectors=args.exclude_selectors,
+                models=args.models, imbalances=args.imbalances)
     except (ValueError, KeyError, OSError, AssertionError) as exc:
         parser.exit(2, f"Cannot create figures: {exc}\n")
 

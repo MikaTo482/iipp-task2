@@ -7,3 +7,4 @@ venv
 experiments/*_shap.json
 CLAUDE_VISUALIZATION_PROMPT.md
 temp_db
+experiments

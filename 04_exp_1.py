@@ -55,6 +55,8 @@ MISSING_THRESHOLD = 50
 USE_CORRELATION_FILTER = True
 CORRELATION_THRESHOLD = 0.8
 
+THRESHOLD_GRID = np.round(np.arange(0.05, 0.96, 0.05), 2).tolist()
+
 def resampling_seed(fold_id):
     return RANDOM_SEED + fold_id
 
@@ -287,17 +289,25 @@ def vote_scores(X, y, use_weights, seed, methods=None, weighting="equal", n_jobs
     return {"scores": scores, "votes": votes, "selected_by": selected_by,
             "weights": {name: 1.0 for name in methods}, "support": support}
 
-def build_model(name, seed):
-    P = MODEL_PARAMS[name]
+def build_model(name, seed, use_weights=False, y_train=None):
+    if name not in ("lr", "rf", "xgb"):
+        raise ValueError(f"Unknown model: {name}")
+    P = MODEL_PARAMS[name].copy()
+    if name in ("lr", "rf"):
+        P["class_weight"] = "balanced" if use_weights else None
     if name == "lr":
         return LogisticRegression(random_state=seed, **P)
     if name == "rf":
         return RandomForestClassifier(random_state=seed, n_jobs=N_JOBS, **P)
     if name == "xgb":
-        xgb_params = P.copy()
-        return XGBClassifier(random_state=seed, n_jobs=N_JOBS, **xgb_params)
-    
-    raise ValueError(f"Unknown model: {name}")
+        if use_weights:
+            labels = np.asarray(y_train)
+            if labels.ndim != 1 or not np.array_equal(np.unique(labels), [0, 1]):
+                raise ValueError("Weighted XGBoost requires y_train containing both 0 (Pass) and 1 (Fail)")
+            P["scale_pos_weight"] = compute_scale_pos_weight(labels)
+        else:
+            P["scale_pos_weight"] = 1.0
+        return XGBClassifier(random_state=seed, n_jobs=N_JOBS, **P)
 
 def preprocess_fold(X_train, X_val):
     n_original = X_train.shape[1]
@@ -477,7 +487,7 @@ if __name__ == "__main__":
     n_features_original = X.shape[1]
     y = (dev_df[TARGET_COL] == 1).astype(int) 
 
-    results, selections, shap_rows = [], [], []
+    results, selections, thresholds = [], [], []
     removed_features = {}
     n_folds = N_SPLITS * N_REPEATS
 
@@ -522,15 +532,18 @@ if __name__ == "__main__":
                     for mdl in MODELS:
                         results.append({"fold": fold_id, "repeat": repeat, "imbalance": imb,
                                         "selector": selector, "model": mdl, "n_features": 0,
-                                        "fit_time(s)": np.nan,"fit_time(ms)": np.nan, "predict_time(s)": np.nan,
-                                        "predict_time(ms)": np.nan,
-                                        "predict_time_per_observation(ms)": np.nan,
-                                        "ap": np.nan, "recall": np.nan, "precision": np.nan,
-                                        "tn": np.nan, "fp": np.nan, "fn": np.nan, "tp": np.nan})
+                                        "fit_time(s)": np.nan, "fit_time(ms)": np.nan,
+                                        "predict_time(s)": np.nan, "predict_time(ms)": np.nan,
+                                        "predict_time_per_observation(ms)": np.nan, "ap": np.nan})
+                        for thr in THRESHOLD_GRID:
+                            thresholds.append({"fold": fold_id, "repeat": repeat, "imbalance": imb,
+                                               "selector": selector, "model": mdl, "threshold": thr,
+                                               "recall": np.nan, "precision": np.nan,
+                                               "tn": np.nan, "fp": np.nan, "fn": np.nan, "tp": np.nan})
                     continue
 
                 for mdl in MODELS:
-                    model = build_model(mdl, seed)
+                    model = build_model(mdl, seed, use_weights=use_weight, y_train=y_train_imb)
 
                     t0 = time.perf_counter()
                     model.fit(X_train_imb[features], y_train_imb)
@@ -540,9 +553,7 @@ if __name__ == "__main__":
                     y_proba = model.predict_proba(X_val_processed[features])[:, 1]
                     predict_time = time.perf_counter() - t0
 
-                    y_pred = (y_proba >= DECISION_THRESHOLD).astype(int)
-                    conf_list = confusion_matrix(y_val, y_pred, labels=[0, 1]).ravel().tolist()  # [TN, FP, FN, TP]
-                    tn, fp, fn, tp = conf_list
+                    ap = average_precision_score(y_val, y_proba)   # primary metric, threshold-free
                     results.append({
                         "fold": fold_id, "repeat": repeat, "imbalance": imb,
                         "selector": selector, "model": mdl, "n_features": len(features),
@@ -551,11 +562,22 @@ if __name__ == "__main__":
                         "predict_time(s)": predict_time,
                         "predict_time(ms)": predict_time * 1000,
                         "predict_time_per_observation(ms)": predict_time / len(y_val) * 1000,
-                        "ap": average_precision_score(y_val, y_proba),   # primary metric
-                        "recall": recall_score(y_val, y_pred, zero_division=0),
-                        "precision": precision_score(y_val, y_pred, zero_division=0),
-                        "tn": tn, "fp": fp, "fn": fn, "tp": tp,
+                        "ap": ap,
                     })
+                    for thr in THRESHOLD_GRID:
+                        y_pred_t = (y_proba >= thr).astype(int)
+                        tn_t, fp_t, fn_t, tp_t = confusion_matrix(y_val, y_pred_t, labels=[0, 1]).ravel().tolist()
+                        thresholds.append({
+                            "fold": fold_id, "repeat": repeat, "imbalance": imb,
+                            "selector": selector, "model": mdl, "threshold": thr,
+                            "n_features": len(features),
+                            "fit_time(s)": fit_time,
+                            "predict_time_per_observation(ms)": predict_time / len(y_val) * 1000,
+                            "ap": ap,
+                            "recall": recall_score(y_val, y_pred_t, zero_division=0),
+                            "precision": precision_score(y_val, y_pred_t, zero_division=0),
+                            "tn": tn_t, "fp": fp_t, "fn": fn_t, "tp": tp_t,
+                        })
 
         print(f"fold {fold_id}/{n_folds} done at {datetime.now().isoformat()}")
         total_time = datetime.now() - start_time
@@ -569,6 +591,7 @@ if __name__ == "__main__":
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     results_df = pd.DataFrame(results)
     selections_df = pd.DataFrame(selections)
+    thresholds_df = pd.DataFrame(thresholds)
     removed_features_df = pd.DataFrame.from_dict(removed_features, orient="index").reset_index().rename(columns={"index": "fold"})
 
     feature_universe = sorted(set().union(*selections_df["candidate_features"]))
@@ -585,16 +608,23 @@ if __name__ == "__main__":
         .agg(
             average_precision_mean=("ap", nanmean),
             average_precision_std=("ap", "std"),
-            recall_mean=("recall", nanmean),
-            precision_mean=("precision", nanmean),
-            tn_mean=("tn", nanmean),
-            fp_mean=("fp", nanmean),
-            fn_mean=("fn", nanmean),
-            tp_mean=("tp", nanmean),
             n_features_mean=("n_features", nanmean),
         )
         .reset_index()
         .sort_values("average_precision_mean", ascending=False, ignore_index=True)
+    )
+
+    threshold_summary_df = (
+        thresholds_df.groupby(["imbalance", "selector", "model", "threshold"])
+        .agg(
+            recall_mean=("recall", nanmean),
+            precision_mean=("precision", nanmean),
+            tp_mean=("tp", nanmean),
+            fn_mean=("fn", nanmean),
+            fp_mean=("fp", nanmean),
+            tn_mean=("tn", nanmean),
+        )
+        .reset_index()
     )
     
     # timing summary (median and IQR over the 50 folds)
@@ -622,8 +652,10 @@ if __name__ == "__main__":
         ("stability", stability_df),
         ("feature_frequency", feature_frequency_df),
         ("removed_features", removed_features_df),
+        ("thresholds", thresholds_df),
         ("selection_time", selection_time_df),
         ("model_time", model_time_df),
+        ("threshold_summary", threshold_summary_df),
     ):
         frame.to_json(
             os.path.join(RESULTS_DIR, f"{run_id}_{name}.json"),
@@ -635,7 +667,7 @@ if __name__ == "__main__":
     config = {
             "run_id": run_id, "random_seed": RANDOM_SEED,
             "algorithm_seed": ALGORITHM_SEED,
-            "decision_threshold": DECISION_THRESHOLD,
+            "threshold_grid": THRESHOLD_GRID,
             "n_splits": N_SPLITS, "n_repeats": N_REPEATS,
             "n_features_original": n_features_original,
             "stability_feature_universe": feature_universe,
@@ -643,6 +675,10 @@ if __name__ == "__main__":
             "correlation_threshold": CORRELATION_THRESHOLD,
             "selectors": SELECTORS, "imbalance": IMBALANCE, "models": MODELS,
             "selector_params": SELECTOR_PARAMS, "model_params": MODEL_PARAMS,
+            "learner_weighting": {
+                "condition": "weight", "lr": "balanced", "rf": "balanced",
+                "xgb": "training_negative_to_positive_ratio",
+            },
             "scaler": "RobustScaler",
             "n_jobs": N_JOBS,
             "machine": platform.machine(),
